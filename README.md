@@ -33,7 +33,7 @@ api_key = "sk-example"
 model = "gpt-5-nano"
 ```
 
-### Usage
+### Chat Interface
 
 onui is a common chat-based agent. Please type your commands after the prompt.
 
