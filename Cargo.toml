@@ -1,0 +1,36 @@
+[package]
+name = "onui"
+description = "Minimalist's AI Agent in Single Executable"
+authors = ["lumiknit <aasr4r4@gmail.com>"]
+license = "MPL-2.0"
+readme = "README.md"
+documentation = "https://github.com/lumiknit/onui"
+homepage = "https://github.com/lumiknit/onui"
+repository = "https://github.com/lumiknit/onui"
+
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+const_format = "0.2"
+mlua = { version = "0.11", features = ["lua54", "vendored"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.36", features = [
+	"rt-multi-thread",
+	"macros",
+	"sync",
+	"time",
+] }
+toml = "0.9.8"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+incremental = false
