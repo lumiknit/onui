@@ -3,14 +3,13 @@ mod config;
 mod consts;
 mod io;
 mod llm;
-mod llm_openai;
 mod lua;
 
 use agent::Agent;
 use anyhow::Context;
 use consts::DEFAULT_SYSTEM_PROMPT;
 use io::cli::CliIO;
-use llm_openai::LLMLuaClient;
+use llm::LLMLuaClient;
 use lua::LuaVM;
 
 #[tokio::main]

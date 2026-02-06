@@ -1,5 +1,5 @@
+use super::traits::{ChatMessage, LLMClient};
 use crate::config::LLMOpenAIConfig;
-use crate::llm::{ChatMessage, LLMClient};
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

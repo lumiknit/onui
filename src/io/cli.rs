@@ -30,7 +30,6 @@ impl super::IO for CliIO {
     fn input_channel(&mut self) -> mpsc::Receiver<super::UserMsg> {
         let (tx, rx) = mpsc::channel(32);
         let history = self.input_history.clone();
-        let pipe = self.pipe;
 
         let stdin_tx = tx.clone();
         tokio::spawn(async move {
@@ -39,12 +38,6 @@ impl super::IO for CliIO {
             let mut lines = reader.lines();
 
             loop {
-                if !pipe {
-                    print!("> ");
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-                }
-
                 match lines.next_line().await {
                     Ok(Some(line)) => {
                         let trimmed = line.trim().to_string();
@@ -86,8 +79,23 @@ impl super::IO for CliIO {
 
         let ctrl_tx = tx.clone();
         tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                let _ = ctrl_tx.send(super::UserMsg::Cancel).await;
+            let mut count = 0u8;
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    break;
+                }
+                count = count.saturating_add(1);
+                let msg = if count >= 2 {
+                    super::UserMsg::Exit
+                } else {
+                    super::UserMsg::Cancel
+                };
+                if ctrl_tx.send(msg).await.is_err() {
+                    break;
+                }
+                if count >= 2 {
+                    break;
+                }
             }
         });
 
@@ -142,8 +150,11 @@ impl super::IO for CliIO {
     }
 
     async fn msg_lua(&mut self, code: &str) -> Result<bool> {
-        println!("Lua code to execute:\n{}", code);
-        println!("Approve execution? (y/n): ");
+        println!("------[lua]------");
+        for line in code.lines() {
+            println!("    {}", line);
+        }
+        print!("-- Approve execution? (y/n): ");
         use std::io::{self, Write};
         io::stdout().flush().unwrap();
         let mut input = String::new();
@@ -155,6 +166,15 @@ impl super::IO for CliIO {
     async fn msg_lua_result(&mut self, output: &str) -> Result<()> {
         for line in output.lines() {
             println!("> {}", line);
+        }
+        Ok(())
+    }
+
+    async fn llm_stopped(&mut self) -> Result<()> {
+        if !self.pipe {
+            print!("> ");
+            use std::io::Write;
+            std::io::stdout().flush().unwrap();
         }
         Ok(())
     }

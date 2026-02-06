@@ -31,4 +31,8 @@ pub trait IO {
     /// Handle to display the result of Lua code execution to the user.
     /// Output is complete lines.
     async fn msg_lua_result(&mut self, output: &str) -> Result<()>;
+
+    /// Handle to display LLM stopped. (Answer finished, etc.)
+    /// You may show a prompt or do nothing.
+    async fn llm_stopped(&mut self) -> Result<()>;
 }

@@ -11,6 +11,12 @@ pub struct Agent<L, R, I> {
     history: Vec<ChatMessage>,
 }
 
+enum CommandResult {
+    Exit,
+    Handled,
+    NotCommand,
+}
+
 impl<L, R, I> Agent<L, R, I>
 where
     L: LLMClient,
@@ -51,7 +57,7 @@ where
     pub async fn run(&mut self, config: &Config) -> Result<()> {
         self.io
             .msg_system(&format!(
-                "Running onui with config: {} (LLM: {}, cwd: {})",
+                "Running onui with config: {}\n- LLM: {}\n- cwd: {}",
                 config
                     .config_path
                     .clone()
@@ -60,29 +66,39 @@ where
                 config.workspace_dir().display()
             ))
             .await?;
+        self.io.llm_stopped().await?;
 
         let mut input_rx = self.io.input_channel();
         while let Some(message) = input_rx.recv().await {
             match message {
                 UserMsg::Exit => {
                     self.io.msg_system("Goodbye.").await?;
-                    break;
+                    return Ok(());
                 }
                 UserMsg::Cancel => {
-                    self.io.msg_system("Cancelled.").await?;
+                    self.io
+                        .msg_system("Cancelled. 한번 더 누르면 종료됩니다")
+                        .await?;
+                    self.io.llm_stopped().await?;
                 }
                 UserMsg::Input(line) => {
-                    if self.handle_command(&line).await? {
-                        break;
+                    match self.handle_command(&line).await? {
+                        CommandResult::Exit => return Ok(()),
+                        CommandResult::Handled => {
+                            self.io.llm_stopped().await?;
+                            continue;
+                        }
+                        CommandResult::NotCommand => {}
                     }
 
                     let response = self.handle_user_input(&line).await?;
                     if let Some(content) = response.content.as_deref() {
                         if !content.is_empty() {
                             self.io.msg_assistant(content).await?;
-                            self.io.msg_assistant("").await?;
                         }
                     }
+                    self.io.msg_assistant("").await?;
+                    self.io.llm_stopped().await?;
                 }
             }
         }
@@ -90,17 +106,17 @@ where
         Ok(())
     }
 
-    async fn handle_command(&mut self, line: &str) -> Result<bool> {
+    async fn handle_command(&mut self, line: &str) -> Result<CommandResult> {
         let trimmed = line.trim();
         if !trimmed.starts_with('/') {
-            return Ok(false);
+            return Ok(CommandResult::NotCommand);
         }
 
         let normalized = trimmed.to_ascii_lowercase();
         match normalized.as_str() {
             "/exit" | "/quit" => {
                 self.io.msg_system("Goodbye.").await?;
-                return Ok(true);
+                return Ok(CommandResult::Exit);
             }
             "/help" => {
                 self.io
@@ -122,7 +138,7 @@ where
             }
         }
 
-        Ok(false)
+        Ok(CommandResult::Handled)
     }
 
     pub async fn handle_user_input(&mut self, input: &str) -> Result<ChatMessage> {
@@ -151,9 +167,7 @@ where
                     .lua
                     .execute_script(&code, response.lua_timeout_sec)
                     .context("lua script execution failed")?;
-                let tool_output = self.render_tool_output(
-                    &execution,
-                );
+                let tool_output = self.render_tool_output(&execution);
                 self.io.msg_lua_result(&tool_output).await?;
 
                 let tool_call_id = tool_call_id.unwrap_or_else(|| "call_lua".to_string());
