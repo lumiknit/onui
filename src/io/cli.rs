@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 /// CliIO is an implementation of IO, which is for command line interface.
 pub struct CliIO {
     input_history: Arc<Mutex<Vec<String>>>,
+    pipe: bool,
 }
 
 use anyhow::Result;
@@ -12,9 +13,10 @@ use tokio::sync::mpsc;
 
 impl CliIO {
     /// Create a new CliIO instance.
-    pub fn new() -> Self {
+    pub fn new(pipe: bool) -> Self {
         CliIO {
             input_history: Arc::new(Mutex::new(Vec::new())),
+            pipe,
         }
     }
 
@@ -28,6 +30,7 @@ impl super::IO for CliIO {
     fn input_channel(&mut self) -> mpsc::Receiver<super::UserMsg> {
         let (tx, rx) = mpsc::channel(32);
         let history = self.input_history.clone();
+        let pipe = self.pipe;
 
         let stdin_tx = tx.clone();
         tokio::spawn(async move {
@@ -36,6 +39,12 @@ impl super::IO for CliIO {
             let mut lines = reader.lines();
 
             loop {
+                if !pipe {
+                    print!("> ");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+
                 match lines.next_line().await {
                     Ok(Some(line)) => {
                         let trimmed = line.trim().to_string();

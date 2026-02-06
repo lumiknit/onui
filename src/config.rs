@@ -1,18 +1,70 @@
 use std::{
     collections::HashMap,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug, Default)]
 pub struct Config {
     pub config_path: Option<PathBuf>,
 
+    #[serde(skip)]
+    pub pipe: bool,
+
+    #[serde(skip)]
+    pub path: Option<PathBuf>,
+
     pub default_llm: String,
     pub llm: HashMap<String, LLMConfig>,
+}
+
+/// Parses command line options for `onui`.
+#[derive(Parser, Debug)]
+#[command(author, version, about = "Minimal onui runner")]
+pub struct CliArgs {
+    /// Path to the configuration file.
+    #[arg(short = 'c', long)]
+    pub config: Option<PathBuf>,
+
+    /// Run in pipe-friendly mode instead of interactive.
+    #[arg(long)]
+    pub pipe: bool,
+
+    /// Base directory to run from.
+    pub path: Option<PathBuf>,
+}
+
+impl CliArgs {
+    /// Returns the config file path if provided.
+    /// Paths are:
+    /// - Command line argument (1st)
+    /// - Environment variable `ONUI_CONFIG` (2nd)
+    /// - Current path: `./.onui/config.toml` (3rd)
+    /// - Home directory: `~/.onui/config.toml` (4th)
+    pub fn config_path(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = Vec::new();
+
+        if let Some(ref path) = self.config {
+            paths.push(path.to_path_buf());
+        }
+
+        if let Ok(env_path) = env::var("ONUI_CONFIG") {
+            paths.push(PathBuf::from(env_path));
+        }
+
+        paths.push(PathBuf::from(".").join(".onui").join("config.toml"));
+
+        if let Some(home_dir) = env::home_dir() {
+            let home_config = home_dir.join(".onui").join("config.toml");
+            paths.push(home_config);
+        }
+
+        paths
+    }
 }
 
 /// LLM configuration for each provider defined under `[llm.*]`.
@@ -66,6 +118,12 @@ impl Config {
         }
         Ok(())
     }
+
+    pub fn workspace_dir(&self) -> PathBuf {
+        self.path
+            .clone()
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
 }
 
 pub fn load_from_file(path: &Path) -> Result<Config> {
@@ -95,4 +153,12 @@ pub fn load_from_file_list(paths: &Vec<PathBuf>) -> Result<Config> {
         }
     }
     anyhow::bail!("No valid configuration file found in the provided paths.");
+}
+
+pub fn load_from_cli() -> Result<Config> {
+    let args = CliArgs::parse();
+    let mut config = load_from_file_list(&args.config_path())?;
+    config.pipe = args.pipe;
+    config.path = args.path;
+    Ok(config)
 }

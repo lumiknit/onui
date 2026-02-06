@@ -1,24 +1,21 @@
 mod agent;
-mod cli;
 mod config;
 mod consts;
 mod io;
+mod llm;
 mod llm_openai;
 mod lua;
 
 use agent::Agent;
 use anyhow::Context;
-use clap::Parser;
-use cli::{Cli, CliArgs};
 use consts::DEFAULT_SYSTEM_PROMPT;
+use io::cli::CliIO;
 use llm_openai::LLMLuaClient;
 use lua::LuaVM;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = CliArgs::parse();
-    let config =
-        config::load_from_file_list(&args.config_path()).context("loading configuration")?;
+    let config = config::load_from_cli().context("loading configuration")?;
 
     let llm_config = config.llm.get(&config.default_llm).unwrap_or_else(|| {
         panic!(
@@ -38,10 +35,10 @@ async fn main() -> anyhow::Result<()> {
 
     let lua = LuaVM::new().context("creating Lua VM")?;
     let prompt = system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
-    let mut agent = Agent::new(llm, lua, Some(prompt));
-    let mut cli = Cli::new(args, config);
+    let io = CliIO::new(config.pipe);
+    let mut agent = Agent::new(llm, lua, io, Some(prompt));
 
-    cli.run(&mut agent).await?;
+    agent.run(&config).await?;
 
     Ok(())
 }

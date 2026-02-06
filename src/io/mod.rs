@@ -5,9 +5,6 @@ pub mod tcp;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use cli::CliIO;
-use tcp::TcpIO;
-
 pub enum UserMsg {
     Exit,
     Cancel,

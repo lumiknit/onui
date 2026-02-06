@@ -1,63 +1,10 @@
 use crate::config::LLMOpenAIConfig;
+use crate::llm::{ChatMessage, LLMClient};
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-#[derive(Clone, Debug)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: Option<String>,
-    pub lua_code: Option<String>,
-    pub lua_timeout_sec: Option<u64>,
-    pub tool_call_id: Option<String>,
-}
-
-impl ChatMessage {
-    pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: "system".to_string(),
-            content: Some(content.into()),
-            lua_code: None,
-            lua_timeout_sec: None,
-            tool_call_id: None,
-        }
-    }
-
-    pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: "user".to_string(),
-            content: Some(content.into()),
-            lua_code: None,
-            lua_timeout_sec: None,
-            tool_call_id: None,
-        }
-    }
-
-    pub fn assistant(
-        content: Option<String>,
-        lua_code: Option<String>,
-        tool_call_id: Option<String>,
-    ) -> Self {
-        Self {
-            role: "assistant".to_string(),
-            content,
-            lua_code,
-            lua_timeout_sec: None,
-            tool_call_id,
-        }
-    }
-
-    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self {
-            role: "tool".to_string(),
-            content: Some(content.into()),
-            lua_code: None,
-            lua_timeout_sec: None,
-            tool_call_id: Some(tool_call_id.into()),
-        }
-    }
-}
+use std::{future::Future, pin::Pin};
 
 pub struct LLMLuaClient {
     client: Client,
@@ -151,6 +98,15 @@ impl LLMLuaClient {
         let mut message = ChatMessage::assistant(choice.message.content, lua_code, tool_call_id);
         message.lua_timeout_sec = lua_timeout_sec;
         Ok(message)
+    }
+}
+
+impl LLMClient for LLMLuaClient {
+    fn chat<'a>(
+        &'a self,
+        history: &'a [ChatMessage],
+    ) -> Pin<Box<dyn Future<Output = Result<ChatMessage>> + Send + 'a>> {
+        Box::pin(async move { LLMLuaClient::chat(self, history).await })
     }
 }
 
