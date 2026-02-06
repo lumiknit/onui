@@ -2,6 +2,7 @@ mod agent;
 mod cli;
 mod config;
 mod consts;
+mod io;
 mod llm_openai;
 mod lua;
 

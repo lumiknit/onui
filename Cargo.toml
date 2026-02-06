@@ -15,7 +15,7 @@ edition = "2024"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 const_format = "0.2"
-mlua = { version = "0.11", features = ["lua54", "vendored"] }
+mlua = { version = "0.11", features = ["luajit52", "vendored", "anyhow"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -23,6 +23,8 @@ tokio = { version = "1.36", features = [
 	"rt-multi-thread",
 	"macros",
 	"sync",
+	"io-std",
+	"signal",
 	"time",
 ] }
 toml = "0.9.8"
