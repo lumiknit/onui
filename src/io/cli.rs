@@ -1,40 +1,47 @@
+use anyhow::Result;
+use std::io::{Write, stdin, stdout};
 use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 
 /// CliIO is an implementation of IO, which is for command line interface.
 pub struct CliIO {
     input_history: Arc<Mutex<Vec<String>>>,
-    pipe: bool,
-}
 
-use anyhow::Result;
-use tokio::sync::mpsc;
+    in_chan_sender: mpsc::Sender<super::UserMsg>,
+    in_chan_receiver: Option<mpsc::Receiver<super::UserMsg>>,
+
+    input_task: Option<JoinHandle<()>>,
+    signal_tasks: Vec<JoinHandle<()>>,
+}
 
 impl CliIO {
     /// Create a new CliIO instance.
-    pub fn new(pipe: bool) -> Self {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel(32);
+
         CliIO {
             input_history: Arc::new(Mutex::new(Vec::new())),
-            pipe,
+            in_chan_sender: tx,
+            in_chan_receiver: Some(rx),
+            input_task: None,
+            signal_tasks: Vec::new(),
         }
-    }
-
-    /// Returns a snapshot of user inputs collected so far.
-    pub async fn input_history(&self) -> Vec<String> {
-        self.input_history.lock().await.clone()
     }
 }
 
 impl super::IO for CliIO {
-    fn input_channel(&mut self) -> mpsc::Receiver<super::UserMsg> {
-        let (tx, rx) = mpsc::channel(32);
-        let history = self.input_history.clone();
+    fn open(&mut self) -> Result<()> {
+        if self.input_task.is_some() {
+            return Ok(());
+        }
 
-        let stdin_tx = tx.clone();
-        tokio::spawn(async move {
-            let stdin = io::stdin();
-            let reader = io::BufReader::new(stdin);
+        let history = self.input_history.clone();
+        let stdin_tx = self.in_chan_sender.clone();
+        self.input_task = Some(tokio::spawn(async move {
+            let i = io::stdin();
+            let reader = io::BufReader::new(i);
             let mut lines = reader.lines();
 
             loop {
@@ -51,34 +58,20 @@ impl super::IO for CliIO {
                             lock.push(line.clone());
                         }
 
-                        let msg = match trimmed_str {
-                            "/exit" | "/quit" => super::UserMsg::Exit,
-                            "/cancel" => super::UserMsg::Cancel,
-                            _ => super::UserMsg::Input(line),
-                        };
-
-                        if stdin_tx.send(msg).await.is_err() {
-                            break;
-                        }
-
-                        if matches!(trimmed_str, "/exit" | "/quit") {
+                        if stdin_tx.send(super::UserMsg::Input(line)).await.is_err() {
                             break;
                         }
                     }
-                    Ok(None) => {
-                        let _ = stdin_tx.send(super::UserMsg::Exit).await;
-                        break;
-                    }
-                    Err(_) => {
+                    _ => {
                         let _ = stdin_tx.send(super::UserMsg::Exit).await;
                         break;
                     }
                 }
             }
-        });
+        }));
 
-        let ctrl_tx = tx.clone();
-        tokio::spawn(async move {
+        let ctrl_tx = self.in_chan_sender.clone();
+        self.signal_tasks.push(tokio::spawn(async move {
             let mut count = 0u8;
             loop {
                 if tokio::signal::ctrl_c().await.is_err() {
@@ -97,38 +90,56 @@ impl super::IO for CliIO {
                     break;
                 }
             }
-        });
+        }));
 
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
 
-            let term_tx = tx.clone();
-            tokio::spawn(async move {
+            let term_tx = self.in_chan_sender.clone();
+            self.signal_tasks.push(tokio::spawn(async move {
                 if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
                     sigterm.recv().await;
                     let _ = term_tx.send(super::UserMsg::Exit).await;
                 }
-            });
+            }));
 
-            let hup_tx = tx.clone();
-            tokio::spawn(async move {
+            let hup_tx = self.in_chan_sender.clone();
+            self.signal_tasks.push(tokio::spawn(async move {
                 if let Ok(mut sighup) = signal(SignalKind::hangup()) {
                     sighup.recv().await;
                     let _ = hup_tx.send(super::UserMsg::Exit).await;
                 }
-            });
+            }));
 
-            let quit_tx = tx;
-            tokio::spawn(async move {
+            let quit_tx = self.in_chan_sender.clone();
+            self.signal_tasks.push(tokio::spawn(async move {
                 if let Ok(mut sigquit) = signal(SignalKind::quit()) {
                     sigquit.recv().await;
                     let _ = quit_tx.send(super::UserMsg::Exit).await;
                 }
-            });
+            }));
         }
 
-        rx
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if let Some(handle) = self.input_task.take() {
+            handle.abort();
+        }
+
+        for handle in self.signal_tasks.drain(..) {
+            handle.abort();
+        }
+
+        Ok(())
+    }
+
+    fn input_channel(&mut self) -> mpsc::Receiver<super::UserMsg> {
+        self.in_chan_receiver
+            .take()
+            .expect("input_channel called more than once")
     }
 
     async fn msg_system(&mut self, message: &str) -> Result<()> {
@@ -143,7 +154,6 @@ impl super::IO for CliIO {
             println!();
         } else {
             print!("{}", message);
-            use std::io::Write;
             std::io::stdout().flush().unwrap();
         }
         Ok(())
@@ -154,28 +164,25 @@ impl super::IO for CliIO {
         for line in code.lines() {
             println!("    {}", line);
         }
-        print!("-- Approve execution? (y/n): ");
-        use std::io::{self, Write};
-        io::stdout().flush().unwrap();
+        println!("------[end]------");
+        print!("* Approve execution? (y/n) > ");
+        stdout().flush().unwrap();
         let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
+        stdin().read_line(&mut input).unwrap();
         let approved = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
         Ok(approved)
     }
 
     async fn msg_lua_result(&mut self, output: &str) -> Result<()> {
         for line in output.lines() {
-            println!("> {}", line);
+            println!("--> {}", line);
         }
         Ok(())
     }
 
     async fn llm_stopped(&mut self) -> Result<()> {
-        if !self.pipe {
-            print!("> ");
-            use std::io::Write;
-            std::io::stdout().flush().unwrap();
-        }
+        print!("> ");
+        stdout().flush().unwrap();
         Ok(())
     }
 }

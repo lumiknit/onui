@@ -1,10 +1,65 @@
-use super::traits::{ChatMessage, LLMClient};
-use crate::config::LLMOpenAIConfig;
+use super::traits::{LLMClient, LLMEventHandler};
+use crate::{config::LLMOpenAIConfig, consts::DEFAULT_SYSTEM_PROMPT};
 use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{future::Future, pin::Pin};
+
+#[derive(Clone, Debug)]
+struct ChatMessage {
+    role: String,
+    content: Option<String>,
+    lua_code: Option<String>,
+    lua_timeout_sec: Option<u64>,
+    tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".to_string(),
+            content: Some(content.into()),
+            lua_code: None,
+            lua_timeout_sec: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: Some(content.into()),
+            lua_code: None,
+            lua_timeout_sec: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant(
+        content: Option<String>,
+        lua_code: Option<String>,
+        tool_call_id: Option<String>,
+    ) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content,
+            lua_code,
+            lua_timeout_sec: None,
+            tool_call_id,
+        }
+    }
+
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: Some(content.into()),
+            lua_code: None,
+            lua_timeout_sec: None,
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+}
 
 pub struct LLMLuaClient {
     client: Client,
@@ -12,10 +67,14 @@ pub struct LLMLuaClient {
     base_url: String,
     model: String,
     reasoning_effort: Option<String>,
+    handler: Box<dyn LLMEventHandler>,
+    history: Vec<ChatMessage>,
+    in_flight: bool,
+    pending_tool_call_id: Option<String>,
 }
 
 impl LLMLuaClient {
-    pub fn new(config: &LLMOpenAIConfig) -> Result<Self> {
+    pub fn new(config: &LLMOpenAIConfig, handler: Box<dyn LLMEventHandler>) -> Result<Self> {
         let api_key = config
             .get_api_key()
             .ok_or_else(|| anyhow!("OPENAI_API_KEY is not configured"))?;
@@ -27,24 +86,95 @@ impl LLMLuaClient {
             .clone()
             .unwrap_or_else(|| "gpt-5-nano".to_string());
 
+        let mut history = Vec::new();
+        history.push(ChatMessage::system(DEFAULT_SYSTEM_PROMPT));
         Ok(Self {
             client: Client::new(),
             api_key,
             base_url,
             model,
             reasoning_effort: config.reasoning_effort.clone(),
+            handler,
+            history,
+            in_flight: false,
+            pending_tool_call_id: None,
         })
     }
 
-    pub async fn chat(&self, history: &[ChatMessage]) -> Result<ChatMessage> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let payload =
-            OpenAIChatRequest::from_history(history, &self.model, self.reasoning_effort.clone())?;
+    async fn chat(&self, history: &[ChatMessage]) -> Result<ChatMessage> {
+        Self::chat_with(
+            &self.client,
+            &self.api_key,
+            &self.base_url,
+            &self.model,
+            self.reasoning_effort.clone(),
+            history,
+        )
+        .await
+    }
 
-        let response = self
-            .client
+    async fn run_chat_loop(&mut self) -> Result<()> {
+        loop {
+            if self.history.is_empty() {
+                return Ok(());
+            }
+
+            let response = self.chat(&self.history).await?;
+            self.history.push(response.clone());
+
+            if let Some(code) = response.lua_code.clone() {
+                let tool_call_id = response
+                    .tool_call_id
+                    .clone()
+                    .unwrap_or_else(|| "call_lua".to_string());
+
+                self.pending_tool_call_id = Some(tool_call_id.clone());
+
+                let tool_output = match self.handler.on_lua_call(&code).await {
+                    Ok(output) => output,
+                    Err(err) => {
+                        eprintln!("LLM lua handler failed: {err}");
+                        format!("Lua execution rejected: {err}")
+                    }
+                };
+
+                self.history
+                    .push(ChatMessage::tool(tool_call_id, tool_output));
+                self.pending_tool_call_id = None;
+
+                continue;
+            }
+
+            if let Some(content) = response.content.as_deref() {
+                if !content.is_empty() {
+                    if let Err(err) = self.handler.on_assistant_chunk(content).await {
+                        eprintln!("LLM event handler failed: {err}");
+                    }
+                }
+            }
+
+            let _ = self.handler.on_assistant_chunk("").await;
+
+            break;
+        }
+
+        Ok(())
+    }
+
+    async fn chat_with(
+        client: &Client,
+        api_key: &str,
+        base_url: &str,
+        model: &str,
+        reasoning_effort: Option<String>,
+        history: &[ChatMessage],
+    ) -> Result<ChatMessage> {
+        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let payload = OpenAIChatRequest::from_history(history, model, reasoning_effort)?;
+
+        let response = client
             .post(url)
-            .bearer_auth(&self.api_key)
+            .bearer_auth(api_key)
             .json(&payload)
             .send()
             .await
@@ -101,12 +231,70 @@ impl LLMLuaClient {
     }
 }
 
+#[async_trait(?Send)]
 impl LLMClient for LLMLuaClient {
-    fn chat<'a>(
-        &'a self,
-        history: &'a [ChatMessage],
-    ) -> Pin<Box<dyn Future<Output = Result<ChatMessage>> + Send + 'a>> {
-        Box::pin(async move { LLMLuaClient::chat(self, history).await })
+    async fn send_user_msg(&mut self, message: &str) {
+        if self.in_flight {
+            eprintln!("LLM request ignored: client is busy");
+            return;
+        }
+
+        self.history.push(ChatMessage::user(message));
+        self.in_flight = true;
+        if let Err(err) = self.run_chat_loop().await {
+            eprintln!("LLM processing failed: {err}");
+            let _ = self.handler.on_assistant_chunk("").await;
+        }
+        self.in_flight = false;
+    }
+
+    async fn send_lua_result(&mut self, message: &str) {
+        if self.in_flight {
+            eprintln!("LLM request ignored: client is busy");
+            return;
+        }
+
+        let tool_call_id = self
+            .pending_tool_call_id
+            .take()
+            .unwrap_or_else(|| "call_lua".to_string());
+
+        self.history.push(ChatMessage::tool(tool_call_id, message));
+        self.in_flight = true;
+        if let Err(err) = self.run_chat_loop().await {
+            eprintln!("LLM processing failed: {err}");
+            let _ = self.handler.on_assistant_chunk("").await;
+        }
+        self.in_flight = false;
+    }
+
+    async fn send_lua_rejected(&mut self, message: &str) {
+        if self.in_flight {
+            eprintln!("LLM request ignored: client is busy");
+            return;
+        }
+
+        let tool_call_id = self
+            .pending_tool_call_id
+            .take()
+            .unwrap_or_else(|| "call_lua".to_string());
+
+        self.history.push(ChatMessage::tool(tool_call_id, message));
+        self.in_flight = true;
+        if let Err(err) = self.run_chat_loop().await {
+            eprintln!("LLM processing failed: {err}");
+            let _ = self.handler.on_assistant_chunk("").await;
+        }
+        self.in_flight = false;
+    }
+
+    async fn is_idle(&self) -> bool {
+        !self.in_flight
+    }
+
+    async fn cancel(&mut self) -> Result<()> {
+        self.in_flight = false;
+        Ok(())
     }
 }
 

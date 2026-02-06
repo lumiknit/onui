@@ -5,12 +5,12 @@ mod io;
 mod llm;
 mod lua;
 
-use agent::Agent;
+use agent::{Agent, AgentHandler, AgentResources};
 use anyhow::Context;
-use consts::DEFAULT_SYSTEM_PROMPT;
 use io::cli::CliIO;
-use llm::LLMLuaClient;
 use lua::LuaVM;
+use std::{process::exit, sync::Arc};
+use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,21 +23,17 @@ async fn main() -> anyhow::Result<()> {
         )
     });
 
-    let (llm, system_prompt) = match llm_config {
-        config::LLMConfig::OpenAI(openai_cfg) => (
-            LLMLuaClient::new(openai_cfg), // Future LLM providers can have their validation here.
-            openai_cfg.system_prompt.clone(),
-        ),
-    };
-
-    let llm = llm.context("building LLM client")?;
-
     let lua = LuaVM::new().context("creating Lua VM")?;
-    let prompt = system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
-    let io = CliIO::new(config.pipe);
-    let mut agent = Agent::new(llm, lua, io, Some(prompt));
+    let io = CliIO::new();
+    let resources = Arc::new(Mutex::new(AgentResources::new(lua, io)));
+    let handler = Box::new(AgentHandler::new(resources.clone()));
 
-    agent.run(&config).await?;
+    let llm = llm::instantiate(&llm_config, handler).context("instantiating LLM client")?;
+    let mut agent = Agent::new(&config, llm, resources);
 
-    Ok(())
+    agent.run().await?;
+
+    // Exit, even all tasks are not finished yet.
+    println!("Exiting...");
+    exit(0);
 }

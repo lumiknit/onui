@@ -1,6 +1,5 @@
 /// mod io is the IO interaction module for User or other systems.
 pub mod cli;
-pub mod tcp;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -13,6 +12,14 @@ pub enum UserMsg {
 
 /// IO is an interface for handling LLM or User's interactions.
 pub trait IO {
+    /// Trigger when IO starts.
+    /// This is an helper to setup IO resources.
+    fn open(&mut self) -> Result<()>;
+
+    /// Trigger when IO ends.
+    /// This is an helper to cleanup IO resources.
+    fn close(&mut self) -> Result<()>;
+
     /// Get a channel receiver to listen for user messages.
     fn input_channel(&mut self) -> mpsc::Receiver<UserMsg>;
 

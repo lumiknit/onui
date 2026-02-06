@@ -8,12 +8,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Clone, Deserialize, Debug, Default)]
 pub struct Config {
     pub config_path: Option<PathBuf>,
-
-    #[serde(skip)]
-    pub pipe: bool,
 
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -68,14 +65,14 @@ impl CliArgs {
 }
 
 /// LLM configuration for each provider defined under `[llm.*]`.
-#[derive(Deserialize, Debug)]
+#[derive(Clone, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum LLMConfig {
     OpenAI(LLMOpenAIConfig),
     // Future LLM providers can be added here.
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Clone, Deserialize, Debug)]
 pub struct LLMOpenAIConfig {
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
@@ -158,7 +155,6 @@ pub fn load_from_file_list(paths: &Vec<PathBuf>) -> Result<Config> {
 pub fn load_from_cli() -> Result<Config> {
     let args = CliArgs::parse();
     let mut config = load_from_file_list(&args.config_path())?;
-    config.pipe = args.pipe;
     config.path = args.path;
     Ok(config)
 }

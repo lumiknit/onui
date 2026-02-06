@@ -1,64 +1,37 @@
 use anyhow::Result;
-use std::{future::Future, pin::Pin};
+use async_trait::async_trait;
 
-#[derive(Clone, Debug)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: Option<String>,
-    pub lua_code: Option<String>,
-    pub lua_timeout_sec: Option<u64>,
-    pub tool_call_id: Option<String>,
+#[async_trait(?Send)]
+pub trait LLMEventHandler {
+    /// Called when a new chunk of assistant message is received.
+    /// Note that the message may be incomplete and streaming.
+    async fn on_assistant_chunk(&mut self, msg: &str) -> Result<()>;
+
+    /// Called when tool call lua is requested by the LLM.
+    async fn on_lua_call(&mut self, code: &str) -> Result<String>;
 }
 
-impl ChatMessage {
-    pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: "system".to_string(),
-            content: Some(content.into()),
-            lua_code: None,
-            lua_timeout_sec: None,
-            tool_call_id: None,
-        }
-    }
+/// LLMClient is an interface for sending messages to the LLM.
+/// The implementor should have LLMEventHandler when constructed,
+/// and after each send, the implementor should call the appropriate
+/// LLMEventHandler methods when events occur.
+#[async_trait(?Send)]
+pub trait LLMClient {
+    /// Asynchronously send a message to the LLM.
+    /// The response will be passed by LLM event handler.
+    async fn send_user_msg(&mut self, message: &str);
 
-    pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: "user".to_string(),
-            content: Some(content.into()),
-            lua_code: None,
-            lua_timeout_sec: None,
-            tool_call_id: None,
-        }
-    }
+    /// Asynchronously send a message to the LLM.
+    /// The response will be passed by LLM event handler.
+    async fn send_lua_result(&mut self, message: &str);
 
-    pub fn assistant(
-        content: Option<String>,
-        lua_code: Option<String>,
-        tool_call_id: Option<String>,
-    ) -> Self {
-        Self {
-            role: "assistant".to_string(),
-            content,
-            lua_code,
-            lua_timeout_sec: None,
-            tool_call_id,
-        }
-    }
+    /// Asynchronously send a message to the LLM indicating Lua execution was rejected.
+    /// The response will be passed by LLM event handler.
+    async fn send_lua_rejected(&mut self, message: &str);
 
-    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self {
-            role: "tool".to_string(),
-            content: Some(content.into()),
-            lua_code: None,
-            lua_timeout_sec: None,
-            tool_call_id: Some(tool_call_id.into()),
-        }
-    }
-}
+    /// Asynchronously check if the LLM is idle (not processing any request).
+    async fn is_idle(&self) -> bool;
 
-pub trait LLMClient: Send + Sync {
-    fn chat<'a>(
-        &'a self,
-        history: &'a [ChatMessage],
-    ) -> Pin<Box<dyn Future<Output = Result<ChatMessage>> + Send + 'a>>;
+    /// Asynchronously cancel the current LLM operation.
+    async fn cancel(&mut self) -> Result<()>;
 }
