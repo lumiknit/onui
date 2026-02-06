@@ -1,5 +1,5 @@
 use super::traits::{LLMClient, LLMEventHandler};
-use crate::{config::LLMOpenAIConfig, consts::DEFAULT_SYSTEM_PROMPT};
+use crate::{config::LLMOpenAIConfig, consts::DEFAULT_SYSTEM_PROMPT, llm::traits::Status};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -10,9 +10,15 @@ use serde_json::{Value, json};
 struct ChatMessage {
     role: String,
     content: Option<String>,
-    lua_code: Option<String>,
-    lua_timeout_sec: Option<u64>,
+    lua_calls: Vec<LuaCall>,
     tool_call_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct LuaCall {
+    id: String,
+    code: String,
+    timeout_sec: Option<u64>,
 }
 
 impl ChatMessage {
@@ -20,8 +26,7 @@ impl ChatMessage {
         Self {
             role: "system".to_string(),
             content: Some(content.into()),
-            lua_code: None,
-            lua_timeout_sec: None,
+            lua_calls: Vec::new(),
             tool_call_id: None,
         }
     }
@@ -30,23 +35,17 @@ impl ChatMessage {
         Self {
             role: "user".to_string(),
             content: Some(content.into()),
-            lua_code: None,
-            lua_timeout_sec: None,
+            lua_calls: Vec::new(),
             tool_call_id: None,
         }
     }
 
-    pub fn assistant(
-        content: Option<String>,
-        lua_code: Option<String>,
-        tool_call_id: Option<String>,
-    ) -> Self {
+    pub fn assistant(content: Option<String>, lua_calls: Vec<LuaCall>) -> Self {
         Self {
             role: "assistant".to_string(),
             content,
-            lua_code,
-            lua_timeout_sec: None,
-            tool_call_id,
+            lua_calls,
+            tool_call_id: None,
         }
     }
 
@@ -54,14 +53,13 @@ impl ChatMessage {
         Self {
             role: "tool".to_string(),
             content: Some(content.into()),
-            lua_code: None,
-            lua_timeout_sec: None,
+            lua_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
         }
     }
 }
 
-pub struct LLMLuaClient {
+pub struct OpenAIClient {
     client: Client,
     api_key: String,
     base_url: String,
@@ -70,10 +68,11 @@ pub struct LLMLuaClient {
     handler: Box<dyn LLMEventHandler>,
     history: Vec<ChatMessage>,
     in_flight: bool,
-    pending_tool_call_id: Option<String>,
+
+    status: Status,
 }
 
-impl LLMLuaClient {
+impl OpenAIClient {
     pub fn new(config: &LLMOpenAIConfig, handler: Box<dyn LLMEventHandler>) -> Result<Self> {
         let api_key = config
             .get_api_key()
@@ -97,7 +96,7 @@ impl LLMLuaClient {
             handler,
             history,
             in_flight: false,
-            pending_tool_call_id: None,
+            status: Status::Idle,
         })
     }
 
@@ -122,27 +121,14 @@ impl LLMLuaClient {
             let response = self.chat(&self.history).await?;
             self.history.push(response.clone());
 
-            if let Some(code) = response.lua_code.clone() {
-                let tool_call_id = response
-                    .tool_call_id
-                    .clone()
-                    .unwrap_or_else(|| "call_lua".to_string());
-
-                self.pending_tool_call_id = Some(tool_call_id.clone());
-
-                let tool_output = match self.handler.on_lua_call(&code).await {
-                    Ok(output) => output,
-                    Err(err) => {
+            if !response.lua_calls.is_empty() {
+                self.status = Status::WaitForLuaResult;
+                for call in response.lua_calls.iter() {
+                    if let Err(err) = self.handler.on_lua_call(&call.id, &call.code).await {
                         eprintln!("LLM lua handler failed: {err}");
-                        format!("Lua execution rejected: {err}")
                     }
-                };
-
-                self.history
-                    .push(ChatMessage::tool(tool_call_id, tool_output));
-                self.pending_tool_call_id = None;
-
-                continue;
+                }
+                break;
             }
 
             if let Some(content) = response.content.as_deref() {
@@ -154,6 +140,8 @@ impl LLMLuaClient {
             }
 
             let _ = self.handler.on_assistant_chunk("").await;
+
+            self.status = Status::Idle;
 
             break;
         }
@@ -203,36 +191,35 @@ impl LLMLuaClient {
             .next()
             .ok_or_else(|| anyhow!("OpenAI response missing choices"))?;
 
-        let mut lua_code = None;
-        let mut lua_timeout_sec = None;
-        let mut tool_call_id = None;
-        if let Some(call) = choice
-            .message
-            .tool_calls
-            .as_ref()
-            .and_then(|calls| calls.first())
-        {
-            if call.function.name == "lua" {
+        let mut lua_calls = Vec::new();
+        if let Some(calls) = choice.message.tool_calls.as_ref() {
+            for call in calls {
+                if call.function.name != "lua" {
+                    continue;
+                }
                 let args: Value = serde_json::from_str(&call.function.arguments)
                     .unwrap_or_else(|_| Value::Object(Default::default()));
                 if let Some(code) = args.get("code").and_then(|value| value.as_str()) {
-                    lua_code = Some(code.to_string());
-                    tool_call_id = Some(call.id.clone());
-                }
-                if let Some(timeout_value) = args.get("timeout_sec") {
-                    lua_timeout_sec = parse_timeout(timeout_value);
+                    let timeout_sec = args.get("timeout_sec").and_then(parse_timeout);
+                    lua_calls.push(LuaCall {
+                        id: call.id.clone(),
+                        code: code.to_string(),
+                        timeout_sec,
+                    });
                 }
             }
         }
 
-        let mut message = ChatMessage::assistant(choice.message.content, lua_code, tool_call_id);
-        message.lua_timeout_sec = lua_timeout_sec;
-        Ok(message)
+        Ok(ChatMessage::assistant(choice.message.content, lua_calls))
     }
 }
 
 #[async_trait(?Send)]
-impl LLMClient for LLMLuaClient {
+impl LLMClient for OpenAIClient {
+    async fn get_status(&self) -> Status {
+        self.status.clone()
+    }
+
     async fn send_user_msg(&mut self, message: &str) {
         if self.in_flight {
             eprintln!("LLM request ignored: client is busy");
@@ -241,59 +228,42 @@ impl LLMClient for LLMLuaClient {
 
         self.history.push(ChatMessage::user(message));
         self.in_flight = true;
+        self.status = Status::Generating;
         if let Err(err) = self.run_chat_loop().await {
             eprintln!("LLM processing failed: {err}");
             let _ = self.handler.on_assistant_chunk("").await;
         }
         self.in_flight = false;
+        self.status = Status::Idle;
     }
 
-    async fn send_lua_result(&mut self, message: &str) {
+    async fn send_lua_result(&mut self, results: Vec<super::traits::LuaResult>) {
         if self.in_flight {
             eprintln!("LLM request ignored: client is busy");
             return;
         }
 
-        let tool_call_id = self
-            .pending_tool_call_id
-            .take()
-            .unwrap_or_else(|| "call_lua".to_string());
-
-        self.history.push(ChatMessage::tool(tool_call_id, message));
+        for result in results {
+            self.history
+                .push(ChatMessage::tool(result.id, result.output));
+        }
         self.in_flight = true;
+        self.status = Status::Generating;
         if let Err(err) = self.run_chat_loop().await {
             eprintln!("LLM processing failed: {err}");
             let _ = self.handler.on_assistant_chunk("").await;
         }
         self.in_flight = false;
-    }
-
-    async fn send_lua_rejected(&mut self, message: &str) {
-        if self.in_flight {
-            eprintln!("LLM request ignored: client is busy");
-            return;
-        }
-
-        let tool_call_id = self
-            .pending_tool_call_id
-            .take()
-            .unwrap_or_else(|| "call_lua".to_string());
-
-        self.history.push(ChatMessage::tool(tool_call_id, message));
-        self.in_flight = true;
-        if let Err(err) = self.run_chat_loop().await {
-            eprintln!("LLM processing failed: {err}");
-            let _ = self.handler.on_assistant_chunk("").await;
-        }
-        self.in_flight = false;
+        self.status = Status::Idle;
     }
 
     async fn is_idle(&self) -> bool {
-        !self.in_flight
+        matches!(self.status, Status::Idle)
     }
 
     async fn cancel(&mut self) -> Result<()> {
         self.in_flight = false;
+        self.status = Status::Idle;
         Ok(())
     }
 }
@@ -342,15 +312,11 @@ impl OpenAIMessage {
     fn from_chat(message: &ChatMessage) -> Result<Self> {
         let mut tool_calls = Vec::new();
         if message.role == "assistant" {
-            if let Some(code) = message.lua_code.as_deref() {
-                let call_id = message
-                    .tool_call_id
-                    .clone()
-                    .unwrap_or_else(|| "call_lua".to_string());
+            for call in message.lua_calls.iter() {
                 tool_calls.push(OpenAIToolCall::lua_call(
-                    call_id,
-                    code,
-                    message.lua_timeout_sec,
+                    call.id.clone(),
+                    &call.code,
+                    call.timeout_sec,
                 )?);
             }
         }

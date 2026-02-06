@@ -7,7 +7,7 @@ mod lua;
 
 use agent::{Agent, AgentHandler, AgentResources};
 use anyhow::Context;
-use io::cli::CliIO;
+use io::{IO, cli::CliIO};
 use lua::LuaVM;
 use std::{process::exit, sync::Arc};
 use tokio::sync::Mutex;
@@ -24,12 +24,16 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let lua = LuaVM::new().context("creating Lua VM")?;
-    let io = CliIO::new();
-    let resources = Arc::new(Mutex::new(AgentResources::new(lua, io)));
-    let handler = Box::new(AgentHandler::new(resources.clone()));
+    let mut io = CliIO::new();
+    let io_chan = io.open().context("opening IO")?;
+    let resources = Arc::new(Mutex::new(AgentResources::new(lua)));
+    let handler = Box::new(AgentHandler::new(
+        resources.clone(),
+        io_chan.output_tx.clone(),
+    ));
 
     let llm = llm::instantiate(&llm_config, handler).context("instantiating LLM client")?;
-    let mut agent = Agent::new(&config, llm, resources);
+    let mut agent = Agent::new(&config, llm, resources, io, io_chan);
 
     agent.run().await?;
 
