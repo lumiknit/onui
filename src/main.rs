@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let mut io = CliIO::new();
     let io_chan = io.open().context("opening IO")?;
 
-    let resources = AgentResources::new(lua);
+    let resources = AgentResources::new();
     let resources = Arc::new(Mutex::new(resources));
     let handler = Box::new(AgentHandler::new(
         resources.clone(),
@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
     ));
     let llm = llm::instantiate(&llm_config, handler).context("instantiating LLM client")?;
 
-    let mut agent = Agent::new(&config, llm, resources, io, io_chan);
+    let mut agent = Agent::new(&config, llm, lua, resources, io, io_chan);
 
     agent.run().await.context("running agent")?;
 

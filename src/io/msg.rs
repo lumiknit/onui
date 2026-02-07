@@ -49,13 +49,6 @@ pub enum Input {
 }
 
 impl Input {
-    pub fn as_text(&self) -> Option<&str> {
-        match self {
-            Input::Text(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
-
     pub fn from_raw(original: &str) -> Self {
         let trimmed = original.trim();
         if let Some(stripped) = trimmed.strip_prefix('/') {

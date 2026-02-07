@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::io::{self, IO, IOChan, Input, Output};
-use crate::llm::{LLMClient, LLMEventHandler, Status};
+use crate::llm::{BoxedLLMClient, LLMClient, LLMEventHandler, Status};
 use crate::lua::{self, LuaRuntime};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -10,7 +10,6 @@ use tokio::task::JoinHandle;
 
 enum ApprovalTarget {
     All,
-    One(String),
 }
 
 struct PendingLua {
@@ -21,21 +20,18 @@ struct PendingLua {
     output: Option<String>,
 }
 
-pub struct AgentResources<R: lua::LuaRuntime> {
+pub struct AgentResources {
     pending_lua: Vec<PendingLua>,
     determined_lua: Vec<PendingLua>,
-
-    lua: R,
 
     llm_task: Option<JoinHandle<Result<()>>>,
 }
 
-impl<R: lua::LuaRuntime> AgentResources<R> {
-    pub fn new(lua: R) -> Self {
+impl AgentResources {
+    pub fn new() -> Self {
         Self {
             pending_lua: Vec::new(),
             determined_lua: Vec::new(),
-            lua,
             llm_task: None,
         }
     }
@@ -44,16 +40,9 @@ impl<R: lua::LuaRuntime> AgentResources<R> {
         !self.pending_lua.is_empty()
     }
 
-    pub fn get_lua_targets(&self, target: ApprovalTarget) -> Vec<String> {
+    fn get_lua_targets(&self, target: ApprovalTarget) -> Vec<String> {
         match target {
             ApprovalTarget::All => self.pending_lua.iter().map(|p| p.id.clone()).collect(),
-            ApprovalTarget::One(id) => {
-                if self.pending_lua.iter().any(|p| p.id == id) {
-                    vec![id]
-                } else {
-                    vec![]
-                }
-            }
         }
     }
 
@@ -61,11 +50,11 @@ impl<R: lua::LuaRuntime> AgentResources<R> {
         self.pending_lua.iter().position(|p| p.id == id)
     }
 
-    pub fn pending_lua_code(&self, id: &str) -> Option<String> {
+    fn pending_lua_job(&self, id: &str) -> Option<(String, u64)> {
         self.pending_lua
             .iter()
             .find(|p| p.id == id)
-            .map(|p| p.code.clone())
+            .map(|p| (p.code.clone(), p.timeout_sec))
     }
 
     pub fn determine_lua(&mut self, id: &str, approve: bool, output: String) -> Result<()> {
@@ -86,13 +75,13 @@ impl<R: lua::LuaRuntime> AgentResources<R> {
     }
 }
 
-pub struct AgentHandler<R: lua::LuaRuntime> {
-    resources: Arc<Mutex<AgentResources<R>>>,
+pub struct AgentHandler {
+    resources: Arc<Mutex<AgentResources>>,
     output_tx: mpsc::Sender<Output>,
 }
 
-impl<R: lua::LuaRuntime> AgentHandler<R> {
-    pub fn new(resources: Arc<Mutex<AgentResources<R>>>, output_tx: mpsc::Sender<Output>) -> Self {
+impl AgentHandler {
+    pub fn new(resources: Arc<Mutex<AgentResources>>, output_tx: mpsc::Sender<Output>) -> Self {
         Self {
             resources,
             output_tx,
@@ -101,7 +90,7 @@ impl<R: lua::LuaRuntime> AgentHandler<R> {
 }
 
 #[async_trait(?Send)]
-impl<R: lua::LuaRuntime> LLMEventHandler for AgentHandler<R> {
+impl LLMEventHandler for AgentHandler {
     async fn on_assistant_chunk(&mut self, msg: &str) -> Result<()> {
         send_output(&self.output_tx, Output::AssistantMsg(msg.to_string())).await?;
         Ok(())
@@ -139,15 +128,16 @@ impl<R: lua::LuaRuntime> LLMEventHandler for AgentHandler<R> {
 enum CommandResult {
     Exit,
     Handled,
-    NotCommand,
 }
 
 pub struct Agent<R: lua::LuaRuntime, I> {
     io: I,
     config: Config,
-    resources: Arc<Mutex<AgentResources<R>>>,
+    resources: Arc<Mutex<AgentResources>>,
 
-    llm: Arc<Mutex<Box<dyn LLMClient>>>,
+    llm: Arc<Mutex<BoxedLLMClient>>,
+
+    lua: R,
 
     input_rx: mpsc::Receiver<Input>,
     output_tx: mpsc::Sender<Output>,
@@ -161,7 +151,8 @@ where
     pub fn new(
         config: &Config,
         llm: Box<dyn LLMClient>,
-        resources: Arc<Mutex<AgentResources<R>>>,
+        lua: R,
+        resources: Arc<Mutex<AgentResources>>,
         io: I,
         io_chan: IOChan,
     ) -> Self {
@@ -170,6 +161,7 @@ where
             io,
             config: config.clone(),
             llm: Arc::new(Mutex::new(llm)),
+            lua: lua,
             output_tx: io_chan.output_tx,
             input_rx: io_chan.input_rx,
         }
@@ -193,16 +185,31 @@ where
     }
 
     async fn show_status(&mut self) -> Result<()> {
+        let llm_status = {
+            let llm = self.llm.lock().await;
+            llm.get_status().await
+        };
+        let llm_status_text = match llm_status {
+            Status::Idle => "idle",
+            Status::WaitForLuaResult => "waiting for lua",
+            Status::Generating => "generating",
+        };
+        let pending_lua = {
+            let guard = self.resources.lock().await;
+            guard.pending_lua.len()
+        };
         send_output(
             &self.output_tx,
             Output::SystemMsg(format!(
-                "Running onui with config: {}\n- LLM: {}\n- cwd: {}",
+                "Running onui with config: {}\n- LLM: {}\n- cwd: {}\n- LLM status: {}\n- pending lua: {}",
                 self.config
                     .config_path
                     .clone()
                     .map_or("N/A".to_string(), |p| p.display().to_string()),
                 self.config.default_llm,
-                self.config.workspace_dir().display()
+                self.config.workspace_dir().display(),
+                llm_status_text,
+                pending_lua
             )),
         )
         .await?;
@@ -240,7 +247,7 @@ where
                 }
                 Ok(false)
             }
-            Input::Command { cmd, arg, details } => match self.handle_command(cmd, &arg).await? {
+            Input::Command { cmd, arg, .. } => match self.handle_command(cmd, &arg).await? {
                 CommandResult::Exit => Ok(true),
                 _ => Ok(false),
             },
@@ -265,17 +272,25 @@ where
             let guard = self.resources.lock().await;
             guard.get_lua_targets(target)
         };
+        let mut results = Vec::new();
         for id in targets {
-            let mut guard = self.resources.lock().await;
-
-            let code = guard
-                .pending_lua_code(&id)
-                .ok_or_else(|| anyhow!("No pending lua with id {}", id))?;
-            let output = match guard.lua.execute_script(&code, None) {
-                Ok(result) => result.to_string(),
-                Err(err) => format!("Lua execution error: {}", err),
+            let output = {
+                let mut guard = self.resources.lock().await;
+                let (code, timeout_sec) = guard
+                    .pending_lua_job(&id)
+                    .ok_or_else(|| anyhow!("No pending lua with id {}", id))?;
+                let result = match self.lua.execute_script(&code, Some(timeout_sec)) {
+                    Ok(exec) => exec.to_string(),
+                    Err(err) => format!("Lua execution error: {}", err),
+                };
+                guard.determine_lua(&id, true, result.clone())?;
+                result
             };
-            guard.determine_lua(&id, true, output)?;
+            results.push((id.clone(), output));
+        }
+        if !results.is_empty() {
+            let mut llm = self.llm.lock().await;
+            llm.send_lua_results(&results).await?;
         }
         Ok(())
     }
@@ -285,15 +300,17 @@ where
             let guard = self.resources.lock().await;
             guard.get_lua_targets(target)
         };
+        let mut results = Vec::new();
         for id in targets {
             let mut guard = self.resources.lock().await;
-            guard.determine_lua(&id, false, "Reject by user.".to_string())?;
+            let output = "Reject by user.".to_string();
+            guard.determine_lua(&id, false, output.clone())?;
+            results.push((id.clone(), output));
         }
-        Ok(())
-    }
-
-    async fn handle_text_as_user_message(&mut self, line: &str) -> Result<()> {
-        self.handle_user_input(line).await?;
+        if !results.is_empty() {
+            let mut llm = self.llm.lock().await;
+            llm.send_lua_results(&results).await?;
+        }
         Ok(())
     }
 
@@ -317,27 +334,71 @@ where
                 send_output(
                     &self.output_tx,
                     Output::SystemMsg(
-                        "Commands: /help, /new, /reset-vm, /cancel, /exit".to_string(),
+                        "Commands: /help, /status, /reset-vm, /cancel, /exit, /approve, /reject"
+                            .to_string(),
                     ),
                 )
                 .await?;
             }
-            io::Command::Approve => {
+            io::Command::Status => {
+                self.show_status().await?;
+            }
+            io::Command::ResetVM => {
+                {
+                    let mut guard = self.resources.lock().await;
+                    self.lua.reset()?;
+                    guard.pending_lua.clear();
+                    guard.determined_lua.clear();
+                }
                 send_output(
                     &self.output_tx,
-                    Output::SystemMsg("New conversation started.".to_string()),
+                    Output::SystemMsg("Lua VM reset.".to_string()),
                 )
                 .await?;
             }
-            _ => {
-                let suffix = if arg.is_empty() {
-                    "".to_string()
+            io::Command::Approve => {
+                if self.has_pending_lua().await? {
+                    self.approve_lua(ApprovalTarget::All).await?;
+                    send_output(
+                        &self.output_tx,
+                        Output::SystemMsg("Approved pending Lua scripts.".to_string()),
+                    )
+                    .await?;
                 } else {
-                    format!(" {}", arg)
-                };
+                    send_output(
+                        &self.output_tx,
+                        Output::SystemMsg("No pending Lua scripts to approve.".to_string()),
+                    )
+                    .await?;
+                }
+            }
+            io::Command::Reject => {
+                if self.has_pending_lua().await? {
+                    self.reject_lua(ApprovalTarget::All).await?;
+                    send_output(
+                        &self.output_tx,
+                        Output::SystemMsg("Rejected pending Lua scripts.".to_string()),
+                    )
+                    .await?;
+                } else {
+                    send_output(
+                        &self.output_tx,
+                        Output::SystemMsg("No pending Lua scripts to reject.".to_string()),
+                    )
+                    .await?;
+                }
+            }
+            io::Command::ApproveAlways => {
                 send_output(
                     &self.output_tx,
-                    Output::SystemMsg(format!("Unknown command: /{:?}{}", cmd, suffix)),
+                    Output::SystemMsg("Always-approve mode is not supported yet.".to_string()),
+                )
+                .await?;
+            }
+            io::Command::Compact => {
+                send_output(
+                    &self.output_tx,
+                    Output::SystemMsg("Conversation compaction is not implemented.".to_string()),
                 )
                 .await?;
             }
@@ -349,12 +410,26 @@ where
     async fn handle_user_input(&self, input: &str) -> Result<()> {
         // Spawn a task
         let task = {
-            let llm: Arc<Mutex<Box<dyn LLMClient + 'static>>> = self.llm.clone();
+            let llm: Arc<Mutex<BoxedLLMClient>> = self.llm.clone();
             let input = input.to_string();
-            tokio::task::spawn_local(async move {
-                let mut llm = llm.lock().await;
-                llm.send_user_msg(&input).await;
-                Ok(())
+            let output_tx = self.output_tx.clone();
+            tokio::spawn(async move {
+                let send_result = {
+                    let mut llm = llm.lock().await;
+                    llm.send_user_msg(&input).await
+                };
+                match send_result {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        let _ = output_tx
+                            .send(Output::SystemMsg(format!(
+                                "Failed to send message to LLM: {}",
+                                err
+                            )))
+                            .await;
+                        Err(err)
+                    }
+                }
             })
         };
         self.resources.lock().await.llm_task = Some(task);

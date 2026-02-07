@@ -1,5 +1,3 @@
-use std::sync::atomic::AtomicBool;
-
 use super::traits::{LLMClient, LLMEventHandler};
 use crate::{config::LLMOpenAIConfig, consts::DEFAULT_SYSTEM_PROMPT, llm::traits::Status};
 use anyhow::{Context, Result, anyhow};
@@ -100,24 +98,6 @@ struct OpenAIToolCall {
     function: OpenAIFunction,
 }
 
-impl OpenAIToolCall {
-    fn lua_call(id: String, code: &str, timeout_sec: Option<u64>) -> Result<Self> {
-        let mut args = json!({ "code": code });
-        if let Some(timeout) = timeout_sec {
-            args["timeout_sec"] = json!(timeout);
-        }
-        Ok(Self {
-            id,
-            kind: "function".to_string(),
-            function: OpenAIFunction {
-                name: "lua".to_string(),
-                arguments: serde_json::to_string(&args)
-                    .context("failed to serialize lua arguments")?,
-            },
-        })
-    }
-}
-
 fn parse_timeout(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number.as_u64(),
@@ -175,7 +155,11 @@ impl OpenAIClient {
             .unwrap_or_else(|| "gpt-5-nano".to_string());
 
         let mut history = Vec::new();
-        history.push(OpenAIMessage::system(DEFAULT_SYSTEM_PROMPT));
+        let system_prompt = config
+            .system_prompt
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+        history.push(OpenAIMessage::system(&system_prompt));
         Ok(Self {
             client: Client::new(),
             api_key,
@@ -229,11 +213,7 @@ impl OpenAIClient {
             .next()
             .ok_or_else(|| anyhow!("OpenAI response missing choices"))?;
 
-        let mut lua_calls = Vec::new();
         for call in &choice.message.tool_calls {
-            if call.function.name == "lua" {
-                lua_calls.push(call.clone());
-            }
             let args: Value = serde_json::from_str(&call.function.arguments)
                 .unwrap_or_else(|_| Value::Object(Default::default()));
             if let Some(code) = args.get("code").and_then(|value| value.as_str()) {
@@ -258,23 +238,47 @@ impl OpenAIClient {
             self.history.push(msg.clone());
         }
         self.history.push(response_msg.clone());
+        self.dispatch_assistant_events(&response_msg).await?;
         Ok(response_msg)
+    }
+
+    fn update_status_from_message(&mut self, message: &OpenAIMessage) {
+        self.status = if message.tool_calls.is_empty() {
+            Status::Idle
+        } else {
+            Status::WaitForLuaResult
+        };
+    }
+
+    async fn dispatch_assistant_events(&mut self, message: &OpenAIMessage) -> Result<()> {
+        if let Some(content) = message.content.as_deref() {
+            if !content.is_empty() {
+                self.handler.on_assistant_chunk(content).await?;
+            }
+        }
+        if message.tool_calls.is_empty() {
+            self.handler.on_llm_finished().await?;
+        }
+        Ok(())
     }
 }
 
 #[async_trait(?Send)]
 impl LLMClient for OpenAIClient {
     async fn get_status(&self) -> Status {
-        self.status.clone()
+        self.status
     }
 
     async fn send_user_msg(&mut self, message: &str) -> Result<()> {
+        self.status = Status::Generating;
         let new_msgs = vec![OpenAIMessage::user(message)];
-        self.chat(&new_msgs).await?;
+        let response = self.chat(&new_msgs).await?;
+        self.update_status_from_message(&response);
         Ok(())
     }
 
     async fn send_lua_results(&mut self, results: &[(String, String)]) -> Result<()> {
+        self.status = Status::Generating;
         let mut new_msgs = Vec::new();
         for (id, output) in results {
             let content = format!("Lua execution result:\n{}", output);
@@ -286,7 +290,8 @@ impl LLMClient for OpenAIClient {
             };
             new_msgs.push(msg);
         }
-        self.chat(&new_msgs).await?;
+        let response = self.chat(&new_msgs).await?;
+        self.update_status_from_message(&response);
         Ok(())
     }
 }

@@ -10,7 +10,7 @@ pub enum Status {
 }
 
 #[async_trait(?Send)]
-pub trait LLMEventHandler {
+pub trait LLMEventHandler: Send + Sync {
     /// Called when a new chunk of assistant message is received.
     /// Note that the message may be incomplete and streaming.
     async fn on_assistant_chunk(&mut self, msg: &str) -> Result<()>;
@@ -27,7 +27,7 @@ pub trait LLMEventHandler {
 /// and after each send, the implementor should call the appropriate
 /// LLMEventHandler methods when events occur.
 #[async_trait(?Send)]
-pub trait LLMClient {
+pub trait LLMClient: Send + Sync {
     /// If running return Generating.
     /// Otherwise, wait for user's input, but,
     /// - If some lua call is pending returns WaitForLuaResult.
@@ -42,3 +42,5 @@ pub trait LLMClient {
     /// The results is a list of (id, output) tuples.
     async fn send_lua_results(&mut self, results: &[(String, String)]) -> Result<()>;
 }
+
+pub type BoxedLLMClient = Box<dyn LLMClient + Send>;
