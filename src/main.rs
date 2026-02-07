@@ -26,16 +26,18 @@ async fn main() -> anyhow::Result<()> {
     let lua = LuaVM::new().context("creating Lua VM")?;
     let mut io = CliIO::new();
     let io_chan = io.open().context("opening IO")?;
-    let resources = Arc::new(Mutex::new(AgentResources::new(lua)));
+
+    let resources = AgentResources::new(lua);
+    let resources = Arc::new(Mutex::new(resources));
     let handler = Box::new(AgentHandler::new(
         resources.clone(),
         io_chan.output_tx.clone(),
     ));
-
     let llm = llm::instantiate(&llm_config, handler).context("instantiating LLM client")?;
+
     let mut agent = Agent::new(&config, llm, resources, io, io_chan);
 
-    agent.run().await?;
+    agent.run().await.context("running agent")?;
 
     // Exit, even all tasks are not finished yet.
     println!("Exiting...");

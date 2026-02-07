@@ -16,7 +16,10 @@ pub trait LLMEventHandler {
     async fn on_assistant_chunk(&mut self, msg: &str) -> Result<()>;
 
     /// Called when tool call lua is requested by the LLM.
-    async fn on_lua_call(&mut self, id: &str, code: &str) -> Result<()>;
+    async fn on_lua_call(&mut self, id: &str, code: &str, timeout_sec: Option<u64>) -> Result<()>;
+
+    /// Called when the LLM has finished generating the response.
+    async fn on_llm_finished(&mut self) -> Result<()>;
 }
 
 /// LLMClient is an interface for sending messages to the LLM.
@@ -31,14 +34,11 @@ pub trait LLMClient {
     /// - Otherwise returns Idle.
     async fn get_status(&self) -> Status;
 
-    /// Asynchronously cancel the current LLM operation.
-    async fn cancel(&mut self) -> Result<()>;
-
     /// Asynchronously send a message to the LLM.
     /// The response will be passed by LLM event handler.
-    async fn send_user_msg(&mut self, message: &str);
+    async fn send_user_msg(&mut self, message: &str) -> Result<()>;
 
-    async fn get_lua_code(&self, id: &str) -> Result<String>;
-    async fn approve_lua(&mut self, id: &str, result: &str) -> Result<()>;
-    async fn reject_lua(&mut self, id: &str, reason: &str) -> Result<()>;
+    /// Asynchronously send lua execution results to the LLM.
+    /// The results is a list of (id, output) tuples.
+    async fn send_lua_results(&mut self, results: &[(String, String)]) -> Result<()>;
 }

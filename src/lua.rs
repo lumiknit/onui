@@ -13,6 +13,27 @@ pub struct LuaExecution {
     pub returns: Vec<String>,
 }
 
+impl LuaExecution {
+    /// Check if the execution was successful.
+    pub fn to_string(&self) -> String {
+        let mut result = String::new();
+
+        result.push_str(&"-- Stdin\n");
+        result.push_str(&self.stdout);
+
+        result.push_str(&"-- Returns\n");
+        for ret in &self.returns {
+            result.push_str(&format!("{}\n", ret));
+        }
+
+        if let Some(err) = &self.error {
+            result.push_str(&"-- Error\n");
+            result.push_str(err);
+        }
+        result
+    }
+}
+
 fn value_to_string(lua: &Lua, value: &Value) -> Result<String, mlua::Error> {
     match value {
         Value::String(text) => Ok(text.to_str()?.to_string()),

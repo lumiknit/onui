@@ -6,9 +6,10 @@ use tokio::io::{self, AsyncBufReadExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::io::msg::Action;
+use crate::io::Input;
+use crate::io::msg::Command;
 
-use super::{IOChan, Output, Signal};
+use super::{IOChan, Output};
 
 /// CliIO is an implementation of IO, which is for command line interface.
 pub struct CliIO {
@@ -42,95 +43,72 @@ impl super::IO for CliIO {
             return Err(anyhow!("CliIO is already open"));
         }
 
-        let (signal_tx, signal_rx) = mpsc::channel(32);
         let (input_tx, input_rx) = mpsc::channel(32);
         let (output_tx, output_rx) = mpsc::channel(32);
 
-        let signal_tx_input = signal_tx.clone();
-        let sigint_cnt = self.sigint_cnt.clone();
-        self.async_tasks.push(tokio::spawn(async move {
-            let i = io::stdin();
-            let reader = io::BufReader::new(i);
-            let mut lines = reader.lines();
-
-            let mut buf = String::new();
-
-            loop {
-                if let Ok(Some(line)) = lines.next_line().await {
-                    sigint_cnt.store(0, std::sync::atomic::Ordering::SeqCst);
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-
-                    buf += &line;
-
-                    if buf.ends_with('\\') {
-                        // Continue to read next line.
-                        buf.pop();
-                        buf.push('\n');
-                        continue;
-                    }
-
-                    match Action::from_raw(buf.as_str()) {
-                        Action::Signal(s) => {
-                            let _ = signal_tx_input.send(s).await;
-                        }
-                        Action::Input(i) => {
-                            let _ = input_tx.send(i).await;
-                        }
-                    }
-                }
-            }
-        }));
-
-        let ctrl_tx = signal_tx.clone();
-        let sigint_cnt = self.sigint_cnt.clone();
-        self.async_tasks.push(tokio::spawn(async move {
-            loop {
-                if tokio::signal::ctrl_c().await.is_err() {
-                    break;
-                }
-                sigint_cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let msg = if sigint_cnt.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
-                    Signal::Exit
-                } else {
-                    Signal::Cancel
-                };
-                if ctrl_tx.send(msg).await.is_err() {
-                    break;
-                }
-                if sigint_cnt.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
-                    break;
-                }
-            }
-        }));
-
-        #[cfg(unix)]
         {
-            use tokio::signal::unix::{SignalKind, signal};
-
-            let term_tx = signal_tx.clone();
+            let input_tx = input_tx.clone();
+            let sigint_cnt = self.sigint_cnt.clone();
             self.async_tasks.push(tokio::spawn(async move {
-                if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
-                    sigterm.recv().await;
-                    let _ = term_tx.send(Signal::Exit).await;
+                let i = io::stdin();
+                let reader = io::BufReader::new(i);
+                let mut lines = reader.lines();
+
+                let mut buf = String::new();
+
+                loop {
+                    if let Ok(Some(line)) = lines.next_line().await {
+                        sigint_cnt.store(0, std::sync::atomic::Ordering::SeqCst);
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+
+                        buf += &line;
+
+                        if buf.ends_with('\\') {
+                            // Continue to read next line.
+                            buf.pop();
+                            buf.push('\n');
+                            continue;
+                        }
+
+                        let i = Input::from_raw(buf.as_str());
+                        buf.clear();
+                        let _ = input_tx.send(i).await;
+                    }
                 }
             }));
+        }
 
-            let hup_tx = signal_tx.clone();
+        {
+            let ctrl_tx = input_tx.clone();
+            let sigint_cnt = self.sigint_cnt.clone();
             self.async_tasks.push(tokio::spawn(async move {
-                if let Ok(mut sighup) = signal(SignalKind::hangup()) {
-                    sighup.recv().await;
-                    let _ = hup_tx.send(Signal::Exit).await;
-                }
-            }));
-
-            let quit_tx = signal_tx.clone();
-            self.async_tasks.push(tokio::spawn(async move {
-                if let Ok(mut sigquit) = signal(SignalKind::quit()) {
-                    sigquit.recv().await;
-                    let _ = quit_tx.send(Signal::Exit).await;
+                loop {
+                    if tokio::signal::ctrl_c().await.is_err() {
+                        break;
+                    }
+                    sigint_cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let cmd = if sigint_cnt.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                        Command::Exit
+                    } else {
+                        Command::Cancel
+                    };
+                    if ctrl_tx
+                        .send(Input::Command {
+                            cmd,
+                            arg: String::new(),
+                            details: "signal from ctrl+c".to_string(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if sigint_cnt.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                        break;
+                    }
                 }
             }));
         }
@@ -175,7 +153,6 @@ impl super::IO for CliIO {
         }));
 
         Ok(IOChan {
-            signal_rx,
             input_rx,
             output_tx,
         })

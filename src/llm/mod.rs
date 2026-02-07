@@ -1,9 +1,8 @@
-pub mod lua_call;
 pub mod openai;
 pub mod traits;
 
 pub use openai::OpenAIClient;
-pub use traits::{LLMClient, LLMEventHandler, LuaResult, Status};
+pub use traits::{LLMClient, LLMEventHandler, Status};
 
 use crate::config::LLMConfig;
 
