@@ -187,7 +187,7 @@ where
     async fn show_status(&mut self) -> Result<()> {
         let llm_status = {
             let llm = self.llm.lock().await;
-            llm.get_status().await
+            llm.get_status()
         };
         let llm_status_text = match llm_status {
             Status::Idle => "idle",

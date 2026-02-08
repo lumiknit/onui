@@ -81,6 +81,7 @@ pub struct LLMOpenAIConfig {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub system_prompt: Option<String>,
+    pub stream: Option<bool>, // Default is true
 }
 
 impl LLMOpenAIConfig {

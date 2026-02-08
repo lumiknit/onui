@@ -32,7 +32,7 @@ pub trait LLMClient {
     /// Otherwise, wait for user's input, but,
     /// - If some lua call is pending returns WaitForLuaResult.
     /// - Otherwise returns Idle.
-    async fn get_status(&self) -> Status;
+    fn get_status(&self) -> Status;
 
     fn get_model_name(&self) -> String;
 

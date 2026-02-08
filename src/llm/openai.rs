@@ -66,32 +66,31 @@ struct OpenAIMessage {
 }
 
 impl OpenAIMessage {
-    fn system(content: &str) -> Self {
+    fn content_only(role: &str, content: &str) -> Self {
         Self {
-            role: "system".to_string(),
+            role: role.to_string(),
             content: Some(content.to_string()),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
+    }
+
+    fn system(content: &str) -> Self {
+        Self::content_only("system", content)
     }
 
     fn user(content: &str) -> Self {
-        Self {
-            role: "user".to_string(),
-            content: Some(content.to_string()),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }
+        Self::content_only("user", content)
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct OpenAIFunction {
     name: String,
     arguments: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct OpenAIToolCall {
     id: String,
     #[serde(rename = "type")]
@@ -187,6 +186,25 @@ struct OpenAIToolCallDelta {
     function: Option<OpenAIFunctionDelta>,
 }
 
+impl OpenAIToolCallDelta {
+    fn accumulate(&self, target: &mut OpenAIToolCall) {
+        if let Some(id) = &self.id {
+            target.id = id.clone();
+        }
+        if let Some(kind) = &self.kind {
+            target.kind = kind.clone();
+        }
+        if let Some(function) = &self.function {
+            if let Some(name) = &function.name {
+                target.function.name = name.clone();
+            }
+            if let Some(arguments) = &function.arguments {
+                target.function.arguments.push_str(arguments);
+            }
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 struct OpenAIFunctionDelta {
     #[serde(default)]
@@ -201,6 +219,8 @@ pub struct OpenAIClient {
     base_url: String,
     model: String,
     reasoning_effort: Option<String>,
+    stream: bool,
+
     handler: Box<dyn LLMEventHandler>,
 
     history: Vec<OpenAIMessage>,
@@ -222,6 +242,7 @@ impl OpenAIClient {
             .model
             .clone()
             .unwrap_or_else(|| "gpt-5-nano".to_string());
+        let stream = config.stream.unwrap_or(true);
 
         let mut history = Vec::new();
         let system_prompt = config
@@ -235,6 +256,7 @@ impl OpenAIClient {
             base_url,
             model,
             reasoning_effort: config.reasoning_effort.clone(),
+            stream,
             handler,
             history,
             used_token: 0,
@@ -243,18 +265,14 @@ impl OpenAIClient {
         })
     }
 
-    fn chat_completion_request(
-        &self,
-        history: &Vec<OpenAIMessage>,
-        stream: bool,
-    ) -> Result<reqwest::Request> {
+    fn chat_completion_request(&self, history: &Vec<OpenAIMessage>) -> Result<reqwest::Request> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let payload = OpenAIChatRequest {
             model: self.model.to_string(),
             messages: history,
             tools: vec![OpenAITool::lua_tool()],
             reasoning_effort: self.reasoning_effort.clone(),
-            stream: Some(stream),
+            stream: Some(self.stream),
         };
 
         self.client
@@ -265,7 +283,6 @@ impl OpenAIClient {
             .context("failed to build OpenAI chat completion request")
     }
 
-    #[allow(dead_code)]
     async fn chat_completion(&self, req: reqwest::Request) -> Result<(OpenAIMessage, usize)> {
         let response = self
             .client
@@ -391,34 +408,11 @@ impl OpenAIClient {
 
                     // Ensure we have enough space in the vector
                     while accumulated_tool_calls.len() <= index {
-                        accumulated_tool_calls.push(OpenAIToolCall {
-                            id: String::new(),
-                            kind: String::new(),
-                            function: OpenAIFunction {
-                                name: String::new(),
-                                arguments: String::new(),
-                            },
-                        });
+                        accumulated_tool_calls.push(OpenAIToolCall::default());
                     }
 
                     let accumulated = &mut accumulated_tool_calls[index];
-
-                    if let Some(id) = &tool_call_delta.id {
-                        accumulated.id = id.clone();
-                    }
-
-                    if let Some(kind) = &tool_call_delta.kind {
-                        accumulated.kind = kind.clone();
-                    }
-
-                    if let Some(function) = &tool_call_delta.function {
-                        if let Some(name) = &function.name {
-                            accumulated.function.name = name.clone();
-                        }
-                        if let Some(arguments) = &function.arguments {
-                            accumulated.function.arguments.push_str(arguments);
-                        }
-                    }
+                    tool_call_delta.accumulate(accumulated);
                 }
             }
         }
@@ -459,8 +453,12 @@ impl OpenAIClient {
             new_history.push(msg.clone());
         }
 
-        let req = self.chat_completion_request(&new_history, true)?;
-        let (response_msg, used_tokens) = self.chat_completion_streaming(req).await?;
+        let req = self.chat_completion_request(&new_history)?;
+        let (response_msg, used_tokens) = if self.stream {
+            self.chat_completion_streaming(req).await?
+        } else {
+            self.chat_completion(req).await?
+        };
 
         self.used_token = used_tokens;
         // Update history with new messages and response.
@@ -484,7 +482,7 @@ impl OpenAIClient {
 
 #[async_trait(?Send)]
 impl LLMClient for OpenAIClient {
-    async fn get_status(&self) -> Status {
+    fn get_status(&self) -> Status {
         self.status
     }
 
