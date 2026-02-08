@@ -110,7 +110,7 @@ impl LLMEventHandler for AgentHandler {
     }
 
     async fn on_llm_finished(&mut self) -> Result<()> {
-        send_output(&self.output_tx, Output::AssistantMsg(String::new())).await?;
+        self.output_tx.send(Output::InputReady).await?;
         Ok(())
     }
 }
@@ -163,8 +163,8 @@ where
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        self.pre_run().await?;
         self.show_status().await?;
+        self.pre_run().await?;
         self.main_loop().await?;
         self.post_run().await?;
         Ok(())
@@ -172,6 +172,7 @@ where
 
     async fn pre_run(&mut self) -> Result<()> {
         self.running = true;
+        self.output_tx.send(Output::InputReady).await?;
         Ok(())
     }
 
@@ -229,11 +230,11 @@ where
         while self.running {
             tokio::select! {
                 Some(signal) = self.signal_rx.recv() => {
+                    send_output(&self.output_tx, Output::SystemMsg(format!("Received signal '{:?}'", signal))).await?;
                     if signal == io::Signal::Exit {
                         self.running = false;
                         break;
                     }
-                    send_output(&self.output_tx, Output::SystemMsg(format!("Received signal: {:?}", signal))).await?;
                 }
                 Some(input) = self.input_rx.recv() => {
                     self.handle_input(input).await?;

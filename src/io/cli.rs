@@ -120,14 +120,8 @@ impl super::IO for CliIO {
                         }
                     }
                     Output::AssistantMsg(message) => {
-                        if message.is_empty() {
-                            println!();
-                            print!("> ");
-                            let _ = stdout().flush();
-                        } else {
-                            print!("{}", message);
-                            let _ = stdout().flush();
-                        }
+                        print!("{}", message);
+                        let _ = stdout().flush();
                     }
                     Output::LuaCode { id, code } => {
                         println!("---[LUA:{}]---", id);
@@ -139,11 +133,15 @@ impl super::IO for CliIO {
                         let _ = stdout().flush();
                     }
                     Output::LuaResult { id, output } => {
-                        println!("---[RESULT:{}]---", id);
+                        println!("-->[RESULT:{}]---", id);
                         for line in output.lines() {
-                            println!("--> {}", line);
+                            println!("    {}", line);
                         }
-                        println!("---[END RESULT]---");
+                        println!("-->[END RESULT]---");
+                    }
+                    Output::InputReady => {
+                        print!("\n> ");
+                        let _ = stdout().flush();
                     }
                 }
             }

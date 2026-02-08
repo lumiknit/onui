@@ -98,4 +98,6 @@ pub enum Output {
     AssistantMsg(String),                     // assistant message, may be streaming.
     LuaCode { id: String, code: String },     // lua code to be approved by user.
     LuaResult { id: String, output: String }, // lua execution result, complete lines.
+
+    InputReady,
 }
