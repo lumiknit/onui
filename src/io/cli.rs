@@ -6,7 +6,6 @@ use tokio::io::{self, AsyncBufReadExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::io::msg::Command;
 use crate::io::{Input, Signal};
 
 use super::{IOChan, Output};
@@ -49,6 +48,7 @@ impl super::IO for CliIO {
 
         {
             let input_tx = input_tx.clone();
+            let signal_tx = signal_tx.clone();
             let sigint_cnt = self.sigint_cnt.clone();
             self.async_tasks.push(tokio::spawn(async move {
                 let i = io::stdin();
@@ -76,7 +76,11 @@ impl super::IO for CliIO {
 
                         let i = Input::from_raw(buf.as_str());
                         buf.clear();
-                        let _ = input_tx.send(i).await;
+                        if let Some(signal) = i.as_signal() {
+                            let _ = signal_tx.send(signal).await;
+                        } else {
+                            let _ = input_tx.send(i).await;
+                        }
                     }
                 }
             }));

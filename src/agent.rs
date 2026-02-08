@@ -6,7 +6,6 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinHandle;
 
 enum ApprovalTarget {
     All,
@@ -347,7 +346,7 @@ where
         Ok(())
     }
 
-    async fn handle_command(&mut self, cmd: io::Command, arg: &str) -> Result<CommandResult> {
+    async fn handle_command(&mut self, cmd: io::Command, _arg: &str) -> Result<CommandResult> {
         match cmd {
             io::Command::Exit => {
                 send_output(&self.output_tx, Output::SystemMsg("Goodbye.".to_string())).await?;
@@ -445,7 +444,7 @@ where
         let mut llm = llm.lock().await;
 
         tokio::select! {
-            t = self.signal_rx.recv() => {
+            _t = self.signal_rx.recv() => {
                 Ok(())
             }
             send_result = llm.send_user_msg(&input) => {

@@ -50,6 +50,7 @@ pub enum Input {
     Command {
         cmd: Command,
         arg: String,
+        #[allow(dead_code)]
         details: String,
     },
 }

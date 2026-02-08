@@ -120,7 +120,9 @@ struct OpenAIChatRequest<'a> {
 // Chat Response
 #[derive(Deserialize)]
 struct OpenAIUsage {
+    #[allow(dead_code)]
     prompt_tokens: u32,
+    #[allow(dead_code)]
     completion_tokens: u32,
     total_tokens: u32,
 }
@@ -128,6 +130,7 @@ struct OpenAIUsage {
 #[derive(Deserialize)]
 struct OpenAIChatResponse {
     #[serde(default)]
+    #[allow(dead_code)]
     id: String,
     choices: Vec<OpenAIChoice>,
     usage: OpenAIUsage,
@@ -138,6 +141,7 @@ struct OpenAIChoice {
     message: OpenAIMessage,
 
     #[serde(default)]
+    #[allow(dead_code)]
     finish_reason: Option<String>,
 }
 
