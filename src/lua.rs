@@ -18,12 +18,20 @@ impl LuaExecution {
     pub fn to_string(&self) -> String {
         let mut result = String::new();
 
-        result.push_str(&"-- StdOut\n");
-        result.push_str(&self.stdout);
+        if self.stdout.is_empty() {
+            result.push_str(&"-- (StdOut is EMPTY)\n");
+        } else {
+            result.push_str(&"-- StdOut\n");
+            result.push_str(&self.stdout);
+        }
 
-        result.push_str(&"-- Returns\n");
-        for ret in &self.returns {
-            result.push_str(&format!("{}\n", ret));
+        if self.returns.is_empty() {
+            result.push_str(&"-- (No Returns)\n");
+        } else {
+            result.push_str(&format!("-- Returns ({})\n", self.returns.len()));
+            for ret in &self.returns {
+                result.push_str(&format!("{}\n", ret));
+            }
         }
 
         if let Some(err) = &self.error {

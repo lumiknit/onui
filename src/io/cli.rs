@@ -128,8 +128,8 @@ impl super::IO for CliIO {
                         for line in code.lines() {
                             println!("    {}", line);
                         }
-                        println!("---[END LUA]---");
-                        print!("* Approve execution? (y/n/a) > ");
+                        println!("---[END:{}]---", id);
+                        print!("* Approve execution? (Yes/No/Always)");
                         let _ = stdout().flush();
                     }
                     Output::LuaResult { id, output } => {
@@ -137,7 +137,7 @@ impl super::IO for CliIO {
                         for line in output.lines() {
                             println!("    {}", line);
                         }
-                        println!("-->[END RESULT]---");
+                        println!("-->[END RESULT:{}]---", id);
                     }
                     Output::InputReady => {
                         print!("\n> ");

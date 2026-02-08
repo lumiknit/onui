@@ -13,13 +13,13 @@ pub enum Status {
 pub trait LLMEventHandler {
     /// Called when a new chunk of assistant message is received.
     /// Note that the message may be incomplete and streaming.
-    async fn on_assistant_chunk(&mut self, msg: &str) -> Result<()>;
+    async fn on_assistant_chunk(&self, msg: &str) -> Result<()>;
 
     /// Called when tool call lua is requested by the LLM.
-    async fn on_lua_call(&mut self, id: &str, code: &str, timeout_sec: Option<u64>) -> Result<()>;
+    async fn on_lua_call(&self, id: &str, code: &str, timeout_sec: Option<u64>) -> Result<()>;
 
     /// Called when the LLM has finished generating the response.
-    async fn on_llm_finished(&mut self) -> Result<()>;
+    async fn on_llm_finished(&self) -> Result<()>;
 }
 
 /// LLMClient is an interface for sending messages to the LLM.

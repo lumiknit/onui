@@ -177,6 +177,7 @@ struct OpenAIDelta {
 
 #[derive(Deserialize, Debug, Clone)]
 struct OpenAIToolCallDelta {
+    #[serde(default)]
     index: usize,
     #[serde(default)]
     id: Option<String>,
@@ -242,28 +243,35 @@ impl OpenAIClient {
         })
     }
 
-    async fn chat_completion(
-        &mut self,
+    fn chat_completion_request(
+        &self,
         history: &Vec<OpenAIMessage>,
-    ) -> Result<(OpenAIMessage, usize)> {
+        stream: bool,
+    ) -> Result<reqwest::Request> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let payload = OpenAIChatRequest {
             model: self.model.to_string(),
             messages: history,
             tools: vec![OpenAITool::lua_tool()],
             reasoning_effort: self.reasoning_effort.clone(),
-            stream: None,
+            stream: Some(stream),
         };
 
-        let response = self
-            .client
+        self.client
             .post(url)
             .bearer_auth(&self.api_key)
             .json(&payload)
-            .send()
-            .await
-            .context("failed to call OpenAI chat completions")?;
+            .build()
+            .context("failed to build OpenAI chat completion request")
+    }
 
+    #[allow(dead_code)]
+    async fn chat_completion(&self, req: reqwest::Request) -> Result<(OpenAIMessage, usize)> {
+        let response = self
+            .client
+            .execute(req)
+            .await
+            .context("failed to send OpenAI chat completion request")?;
         let status = response.status();
         let body_text = response
             .text()
@@ -287,6 +295,10 @@ impl OpenAIClient {
             .next()
             .ok_or_else(|| anyhow!("OpenAI response missing choices"))?;
 
+        if let Some(content) = choice.message.content.as_deref() {
+            self.handler.on_assistant_chunk(content).await?;
+        }
+
         for call in &choice.message.tool_calls {
             let args: Value = serde_json::from_str(&call.function.arguments)
                 .unwrap_or_else(|_| Value::Object(Default::default()));
@@ -302,27 +314,14 @@ impl OpenAIClient {
     }
 
     async fn chat_completion_streaming(
-        &mut self,
-        history: &Vec<OpenAIMessage>,
+        &self,
+        request: reqwest::Request,
     ) -> Result<(OpenAIMessage, usize)> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let payload = OpenAIChatRequest {
-            model: self.model.to_string(),
-            messages: history,
-            tools: vec![OpenAITool::lua_tool()],
-            reasoning_effort: self.reasoning_effort.clone(),
-            stream: Some(true),
-        };
-
         let response = self
             .client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
+            .execute(request)
             .await
-            .context("failed to call OpenAI chat completions")?;
-
+            .context("failed to send OpenAI chat completion request")?;
         let status = response.status();
         if !status.is_success() {
             let body_text = response
@@ -356,63 +355,68 @@ impl OpenAIClient {
                     continue;
                 }
 
-                if line.starts_with("data: ") {
-                    let data = &line[6..];
-                    if data == "[DONE]" {
-                        break;
+                if !line.starts_with("data: ") {
+                    continue;
+                }
+
+                let data = &line[6..];
+                if data == "[DONE]" {
+                    break;
+                }
+
+                let chunk_response = serde_json::from_str::<OpenAIStreamResponse>(data)
+                    .map_err(|e| anyhow!("failed to parse chunk: {}: {}", data, e))?;
+                let choice = chunk_response.choices.first().map_or_else(
+                    || Err(anyhow!("OpenAI stream response missing choices")),
+                    |c| Ok(c),
+                )?;
+
+                let delta = &choice.delta;
+
+                // Update role if present
+                if let Some(r) = &delta.role {
+                    role = r.clone();
+                }
+
+                // Accumulate content
+                if let Some(content) = &delta.content {
+                    accumulated_content.push_str(content);
+                    // Send chunk to handler
+                    self.handler.on_assistant_chunk(content).await?;
+                }
+
+                // Accumulate tool calls
+                for tool_call_delta in &delta.tool_calls {
+                    let index = tool_call_delta.index;
+
+                    // Ensure we have enough space in the vector
+                    while accumulated_tool_calls.len() <= index {
+                        accumulated_tool_calls.push(OpenAIToolCall {
+                            id: String::new(),
+                            kind: String::new(),
+                            function: OpenAIFunction {
+                                name: String::new(),
+                                arguments: String::new(),
+                            },
+                        });
                     }
 
-                    if let Ok(chunk_response) = serde_json::from_str::<OpenAIStreamResponse>(data) {
-                        if let Some(choice) = chunk_response.choices.first() {
-                            let delta = &choice.delta;
+                    let accumulated = &mut accumulated_tool_calls[index];
 
-                            // Update role if present
-                            if let Some(r) = &delta.role {
-                                role = r.clone();
-                            }
+                    if let Some(id) = &tool_call_delta.id {
+                        accumulated.id = id.clone();
+                    }
 
-                            // Accumulate content
-                            if let Some(content) = &delta.content {
-                                accumulated_content.push_str(content);
-                                // Send chunk to handler
-                                self.handler.on_assistant_chunk(content).await?;
-                            }
+                    if let Some(kind) = &tool_call_delta.kind {
+                        accumulated.kind = kind.clone();
+                    }
 
-                            // Accumulate tool calls
-                            for tool_call_delta in &delta.tool_calls {
-                                let index = tool_call_delta.index;
-
-                                // Ensure we have enough space in the vector
-                                while accumulated_tool_calls.len() <= index {
-                                    accumulated_tool_calls.push(OpenAIToolCall {
-                                        id: String::new(),
-                                        kind: String::new(),
-                                        function: OpenAIFunction {
-                                            name: String::new(),
-                                            arguments: String::new(),
-                                        },
-                                    });
-                                }
-
-                                let accumulated = &mut accumulated_tool_calls[index];
-
-                                if let Some(id) = &tool_call_delta.id {
-                                    accumulated.id = id.clone();
-                                }
-
-                                if let Some(kind) = &tool_call_delta.kind {
-                                    accumulated.kind = kind.clone();
-                                }
-
-                                if let Some(function) = &tool_call_delta.function {
-                                    if let Some(name) = &function.name {
-                                        accumulated.function.name = name.clone();
-                                    }
-                                    if let Some(arguments) = &function.arguments {
-                                        accumulated.function.arguments.push_str(arguments);
-                                    }
-                                }
-                            }
+                    if let Some(function) = &tool_call_delta.function {
+                        if let Some(name) = &function.name {
+                            accumulated.function.name = name.clone();
+                        }
+                        if let Some(arguments) = &function.arguments {
+                            accumulated.function.arguments.push_str(arguments);
                         }
                     }
                 }
@@ -454,14 +458,18 @@ impl OpenAIClient {
         for msg in new_messages {
             new_history.push(msg.clone());
         }
-        let (response_msg, used_tokens) = self.chat_completion_streaming(&new_history).await?;
+
+        let req = self.chat_completion_request(&new_history, true)?;
+        let (response_msg, used_tokens) = self.chat_completion_streaming(req).await?;
+
         self.used_token = used_tokens;
         // Update history with new messages and response.
         for msg in new_messages {
             self.history.push(msg.clone());
         }
         self.history.push(response_msg.clone());
-        self.dispatch_assistant_events(&response_msg).await?;
+
+        self.handler.on_llm_finished().await?;
         Ok(response_msg)
     }
 
@@ -471,18 +479,6 @@ impl OpenAIClient {
         } else {
             Status::WaitForLuaResult
         };
-    }
-
-    async fn dispatch_assistant_events(&mut self, message: &OpenAIMessage) -> Result<()> {
-        if let Some(content) = message.content.as_deref() {
-            if !content.is_empty() {
-                self.handler.on_assistant_chunk(content).await?;
-            }
-        }
-        if message.tool_calls.is_empty() {
-            self.handler.on_llm_finished().await?;
-        }
-        Ok(())
     }
 }
 

@@ -81,12 +81,12 @@ impl AgentHandler {
 
 #[async_trait(?Send)]
 impl LLMEventHandler for AgentHandler {
-    async fn on_assistant_chunk(&mut self, msg: &str) -> Result<()> {
+    async fn on_assistant_chunk(&self, msg: &str) -> Result<()> {
         send_output(&self.output_tx, Output::AssistantMsg(msg.to_string())).await?;
         Ok(())
     }
 
-    async fn on_lua_call(&mut self, id: &str, code: &str, timeout_sec: Option<u64>) -> Result<()> {
+    async fn on_lua_call(&self, id: &str, code: &str, timeout_sec: Option<u64>) -> Result<()> {
         {
             let mut guard = self.resources.lock().await;
             guard.pending_lua.push(PendingLua {
@@ -109,7 +109,7 @@ impl LLMEventHandler for AgentHandler {
         Ok(())
     }
 
-    async fn on_llm_finished(&mut self) -> Result<()> {
+    async fn on_llm_finished(&self) -> Result<()> {
         self.output_tx.send(Output::InputReady).await?;
         Ok(())
     }
