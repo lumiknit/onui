@@ -13,6 +13,35 @@ pub struct LuaExecution {
     pub returns: Vec<String>,
 }
 
+impl LuaExecution {
+    /// Check if the execution was successful.
+    pub fn to_string(&self) -> String {
+        let mut result = String::new();
+
+        if self.stdout.is_empty() {
+            result.push_str(&"-- (StdOut is EMPTY)\n");
+        } else {
+            result.push_str(&"-- StdOut\n");
+            result.push_str(&self.stdout);
+        }
+
+        if self.returns.is_empty() {
+            result.push_str(&"-- (No Returns)\n");
+        } else {
+            result.push_str(&format!("-- Returns ({})\n", self.returns.len()));
+            for ret in &self.returns {
+                result.push_str(&format!("{}\n", ret));
+            }
+        }
+
+        if let Some(err) = &self.error {
+            result.push_str(&"-- Error\n");
+            result.push_str(err);
+        }
+        result
+    }
+}
+
 fn value_to_string(lua: &Lua, value: &Value) -> Result<String, mlua::Error> {
     match value {
         Value::String(text) => Ok(text.to_str()?.to_string()),
@@ -56,10 +85,47 @@ impl LuaVM {
                 Ok(())
             })
             .expect("Failed to create print function");
-        self.lua
-            .globals()
+        let globals = self.lua.globals();
+        globals
             .set("print", print_fn)
             .expect("Failed to set print function");
+
+        let out_buffer = Rc::clone(&self.out_buffer);
+        let write_fn = self
+            .lua
+            .create_function(move |lua, args: Variadic<Value>| {
+                let mut buffer = out_buffer.borrow_mut();
+                for value in args.iter() {
+                    let text = value_to_string(lua, value)?;
+                    buffer.push_str(&text);
+                }
+                Ok(())
+            })
+            .expect("Failed to create io.write function");
+
+        if let Ok(io_table) = globals.get::<mlua::Table>("io") {
+            io_table
+                .set("stdin", Value::Nil)
+                .expect("Failed to disable io.stdin");
+            io_table
+                .set("stdout", Value::Nil)
+                .expect("Failed to disable io.stdout");
+            io_table
+                .set("stderr", Value::Nil)
+                .expect("Failed to disable io.stderr");
+            io_table
+                .set("write", write_fn)
+                .expect("Failed to override io.write");
+        }
+
+        if let Ok(os_table) = globals.get::<mlua::Table>("os") {
+            os_table
+                .set("exit", Value::Nil)
+                .expect("Failed to disable os.exit");
+            os_table
+                .set("execute", Value::Nil)
+                .expect("Failed to disable os.execute");
+        }
         Ok(())
     }
 
@@ -125,5 +191,10 @@ impl LuaVM {
                 returns: Vec::new(),
             }),
         }
+    }
+
+    pub fn reset(&mut self) -> Result<()> {
+        *self = LuaVM::new()?;
+        Ok(())
     }
 }
