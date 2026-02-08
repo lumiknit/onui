@@ -198,21 +198,31 @@ where
             let guard = self.resources.lock().await;
             guard.pending_lua.len()
         };
-        send_output(
-            &self.output_tx,
-            Output::SystemMsg(format!(
-                "Running onui with config: {}\n- LLM: {}\n- cwd: {}\n- LLM status: {}\n- pending lua: {}",
-                self.config
-                    .config_path
-                    .clone()
-                    .map_or("N/A".to_string(), |p| p.display().to_string()),
-                self.config.default_llm,
-                self.config.workspace_dir().display(),
-                llm_status_text,
-                pending_lua
-            )),
-        )
-        .await?;
+        let llm_model = {
+            let llm = self.llm.lock().await;
+            llm.get_model_name()
+        };
+        let (token_used, token_limit) = {
+            let llm = self.llm.lock().await;
+            llm.context_size()
+        };
+        let msg = format!(
+            "[onui Status]\n\
+            - LLM: {}\n\
+            - Model: {}\n\
+            - LLM Status: {}\n\
+            - Token Usage: {}/{}\n\
+            - cwd: {}\n\
+            - Pending Lua scripts: {}",
+            self.config.default_llm,
+            llm_model,
+            llm_status_text,
+            token_used,
+            token_limit,
+            self.config.workspace_dir().display(),
+            pending_lua
+        );
+        send_output(&self.output_tx, Output::SystemMsg(msg)).await?;
         Ok(())
     }
 

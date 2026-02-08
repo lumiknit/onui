@@ -34,6 +34,11 @@ pub trait LLMClient: Send + Sync {
     /// - Otherwise returns Idle.
     async fn get_status(&self) -> Status;
 
+    fn get_model_name(&self) -> String;
+
+    /// Asynchronously get the context size (used, total) of the LLM.
+    fn context_size(&self) -> (usize, usize);
+
     /// Asynchronously send a message to the LLM.
     /// The response will be passed by LLM event handler.
     async fn send_user_msg(&mut self, message: &str) -> Result<()>;

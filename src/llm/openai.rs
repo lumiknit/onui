@@ -148,7 +148,10 @@ pub struct OpenAIClient {
     model: String,
     reasoning_effort: Option<String>,
     handler: Box<dyn LLMEventHandler>,
+
     history: Vec<OpenAIMessage>,
+    used_token: usize,
+    token_limit: usize,
 
     status: Status,
 }
@@ -180,11 +183,16 @@ impl OpenAIClient {
             reasoning_effort: config.reasoning_effort.clone(),
             handler,
             history,
+            used_token: 0,
+            token_limit: 256 * 1024,
             status: Status::Idle,
         })
     }
 
-    async fn chat_completion(&mut self, history: &Vec<OpenAIMessage>) -> Result<OpenAIMessage> {
+    async fn chat_completion(
+        &mut self,
+        history: &Vec<OpenAIMessage>,
+    ) -> Result<(OpenAIMessage, usize)> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let payload = OpenAIChatRequest {
             model: self.model.to_string(),
@@ -236,7 +244,7 @@ impl OpenAIClient {
             }
         }
 
-        Ok(choice.message)
+        Ok((choice.message, body.usage.total_tokens as usize))
     }
 
     async fn chat(&mut self, new_messages: &[OpenAIMessage]) -> Result<OpenAIMessage> {
@@ -244,7 +252,8 @@ impl OpenAIClient {
         for msg in new_messages {
             new_history.push(msg.clone());
         }
-        let response_msg = self.chat_completion(&new_history).await?;
+        let (response_msg, used_tokens) = self.chat_completion(&new_history).await?;
+        self.used_token = used_tokens;
         // Update history with new messages and response.
         for msg in new_messages {
             self.history.push(msg.clone());
@@ -279,6 +288,14 @@ impl OpenAIClient {
 impl LLMClient for OpenAIClient {
     async fn get_status(&self) -> Status {
         self.status
+    }
+
+    fn get_model_name(&self) -> String {
+        self.model.clone()
+    }
+
+    fn context_size(&self) -> (usize, usize) {
+        (self.used_token, self.token_limit)
     }
 
     async fn send_user_msg(&mut self, message: &str) -> Result<()> {
