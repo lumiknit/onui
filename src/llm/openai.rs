@@ -2,6 +2,7 @@ use super::traits::{LLMClient, LLMEventHandler};
 use crate::{config::LLMOpenAIConfig, consts::DEFAULT_SYSTEM_PROMPT, llm::traits::Status};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -115,6 +116,8 @@ struct OpenAIChatRequest<'a> {
     tools: Vec<OpenAITool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 // Chat Response
@@ -143,6 +146,52 @@ struct OpenAIChoice {
     #[serde(default)]
     #[allow(dead_code)]
     finish_reason: Option<String>,
+}
+
+// Streaming Response
+#[derive(Deserialize, Debug)]
+struct OpenAIStreamResponse {
+    #[serde(default)]
+    #[allow(dead_code)]
+    id: String,
+    choices: Vec<OpenAIStreamChoice>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAIStreamChoice {
+    delta: OpenAIDelta,
+    #[serde(default)]
+    #[allow(dead_code)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct OpenAIDelta {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAIToolCallDelta>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct OpenAIToolCallDelta {
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    function: Option<OpenAIFunctionDelta>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct OpenAIFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 pub struct OpenAIClient {
@@ -203,6 +252,7 @@ impl OpenAIClient {
             messages: history,
             tools: vec![OpenAITool::lua_tool()],
             reasoning_effort: self.reasoning_effort.clone(),
+            stream: None,
         };
 
         let response = self
@@ -251,12 +301,160 @@ impl OpenAIClient {
         Ok((choice.message, body.usage.total_tokens as usize))
     }
 
+    async fn chat_completion_streaming(
+        &mut self,
+        history: &Vec<OpenAIMessage>,
+    ) -> Result<(OpenAIMessage, usize)> {
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let payload = OpenAIChatRequest {
+            model: self.model.to_string(),
+            messages: history,
+            tools: vec![OpenAITool::lua_tool()],
+            reasoning_effort: self.reasoning_effort.clone(),
+            stream: Some(true),
+        };
+
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to call OpenAI chat completions")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response
+                .text()
+                .await
+                .context("failed to read OpenAI error response body")?;
+            return Err(anyhow!(
+                "OpenAI chat completions returned error: status={} body={}",
+                status,
+                body_text
+            ));
+        }
+
+        // Parse SSE stream
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut accumulated_content = String::new();
+        let mut accumulated_tool_calls: Vec<OpenAIToolCall> = Vec::new();
+        let mut role = String::from("assistant");
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("failed to read stream chunk")?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            // Process complete lines
+            while let Some(newline_pos) = buffer.find('\n') {
+                let line = buffer[..newline_pos].trim().to_string();
+                buffer.drain(..=newline_pos);
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                if line.starts_with("data: ") {
+                    let data = &line[6..];
+                    if data == "[DONE]" {
+                        break;
+                    }
+
+                    if let Ok(chunk_response) = serde_json::from_str::<OpenAIStreamResponse>(data) {
+                        if let Some(choice) = chunk_response.choices.first() {
+                            let delta = &choice.delta;
+
+                            // Update role if present
+                            if let Some(r) = &delta.role {
+                                role = r.clone();
+                            }
+
+                            // Accumulate content
+                            if let Some(content) = &delta.content {
+                                accumulated_content.push_str(content);
+                                // Send chunk to handler
+                                self.handler.on_assistant_chunk(content).await?;
+                            }
+
+                            // Accumulate tool calls
+                            for tool_call_delta in &delta.tool_calls {
+                                let index = tool_call_delta.index;
+
+                                // Ensure we have enough space in the vector
+                                while accumulated_tool_calls.len() <= index {
+                                    accumulated_tool_calls.push(OpenAIToolCall {
+                                        id: String::new(),
+                                        kind: String::new(),
+                                        function: OpenAIFunction {
+                                            name: String::new(),
+                                            arguments: String::new(),
+                                        },
+                                    });
+                                }
+
+                                let accumulated = &mut accumulated_tool_calls[index];
+
+                                if let Some(id) = &tool_call_delta.id {
+                                    accumulated.id = id.clone();
+                                }
+
+                                if let Some(kind) = &tool_call_delta.kind {
+                                    accumulated.kind = kind.clone();
+                                }
+
+                                if let Some(function) = &tool_call_delta.function {
+                                    if let Some(name) = &function.name {
+                                        accumulated.function.name = name.clone();
+                                    }
+                                    if let Some(arguments) = &function.arguments {
+                                        accumulated.function.arguments.push_str(arguments);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process accumulated tool calls
+        for call in &accumulated_tool_calls {
+            let args: Value = serde_json::from_str(&call.function.arguments)
+                .unwrap_or_else(|_| Value::Object(Default::default()));
+            if let Some(code) = args.get("code").and_then(|value| value.as_str()) {
+                let timeout_sec = args.get("timeout_sec").and_then(parse_timeout);
+                self.handler
+                    .on_lua_call(&call.id, code, timeout_sec)
+                    .await?;
+            }
+        }
+
+        let message = OpenAIMessage {
+            role,
+            content: if accumulated_content.is_empty() {
+                None
+            } else {
+                Some(accumulated_content)
+            },
+            tool_calls: accumulated_tool_calls,
+            tool_call_id: None,
+        };
+
+        // Since streaming doesn't return token usage, we estimate or return 0
+        // You might want to implement token counting here
+        let estimated_tokens = 0;
+
+        Ok((message, estimated_tokens))
+    }
+
     async fn chat(&mut self, new_messages: &[OpenAIMessage]) -> Result<OpenAIMessage> {
         let mut new_history = self.history.clone();
         for msg in new_messages {
             new_history.push(msg.clone());
         }
-        let (response_msg, used_tokens) = self.chat_completion(&new_history).await?;
+        let (response_msg, used_tokens) = self.chat_completion_streaming(&new_history).await?;
         self.used_token = used_tokens;
         // Update history with new messages and response.
         for msg in new_messages {
