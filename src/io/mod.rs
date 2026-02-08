@@ -5,10 +5,11 @@ pub mod msg;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-pub use msg::{Command, Input, Output};
+pub use msg::{Command, Input, Output, Signal};
 
 pub struct IOChan {
     pub input_rx: mpsc::Receiver<Input>,
+    pub signal_rx: mpsc::Receiver<Signal>,
     pub output_tx: mpsc::Sender<Output>,
 }
 

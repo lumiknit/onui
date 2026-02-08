@@ -6,8 +6,8 @@ use tokio::io::{self, AsyncBufReadExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::io::Input;
 use crate::io::msg::Command;
+use crate::io::{Input, Signal};
 
 use super::{IOChan, Output};
 
@@ -44,6 +44,7 @@ impl super::IO for CliIO {
         }
 
         let (input_tx, input_rx) = mpsc::channel(32);
+        let (signal_tx, signal_rx) = mpsc::channel(32);
         let (output_tx, output_rx) = mpsc::channel(32);
 
         {
@@ -82,7 +83,7 @@ impl super::IO for CliIO {
         }
 
         {
-            let ctrl_tx = input_tx.clone();
+            let ctrl_tx = signal_tx.clone();
             let sigint_cnt = self.sigint_cnt.clone();
             self.async_tasks.push(tokio::spawn(async move {
                 loop {
@@ -90,20 +91,12 @@ impl super::IO for CliIO {
                         break;
                     }
                     sigint_cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let cmd = if sigint_cnt.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
-                        Command::Exit
+                    let sig = if sigint_cnt.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                        Signal::Exit
                     } else {
-                        Command::Cancel
+                        Signal::Cancel
                     };
-                    if ctrl_tx
-                        .send(Input::Command {
-                            cmd,
-                            arg: String::new(),
-                            details: "signal from ctrl+c".to_string(),
-                        })
-                        .await
-                        .is_err()
-                    {
+                    if ctrl_tx.send(sig).await.is_err() {
                         break;
                     }
                     if sigint_cnt.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
@@ -133,20 +126,20 @@ impl super::IO for CliIO {
                         }
                     }
                     Output::LuaCode { id, code } => {
-                        println!("------[lua]------");
-                        println!("    [id] {}", id);
+                        println!("---[LUA:{}]---", id);
                         for line in code.lines() {
                             println!("    {}", line);
                         }
-                        println!("------[end]------");
-                        print!("* Approve execution? (y/n) > ");
+                        println!("---[END LUA]---");
+                        print!("* Approve execution? (y/n/a) > ");
                         let _ = stdout().flush();
                     }
                     Output::LuaResult { id, output } => {
-                        println!("--> [id] {}", id);
+                        println!("---[RESULT:{}]---", id);
                         for line in output.lines() {
                             println!("--> {}", line);
                         }
+                        println!("---[END RESULT]---");
                     }
                 }
             }
@@ -154,6 +147,7 @@ impl super::IO for CliIO {
 
         Ok(IOChan {
             input_rx,
+            signal_rx,
             output_tx,
         })
     }

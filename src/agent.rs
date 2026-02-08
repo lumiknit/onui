@@ -23,8 +23,6 @@ struct PendingLua {
 pub struct AgentResources {
     pending_lua: Vec<PendingLua>,
     determined_lua: Vec<PendingLua>,
-
-    llm_task: Option<JoinHandle<Result<()>>>,
 }
 
 impl AgentResources {
@@ -32,7 +30,6 @@ impl AgentResources {
         Self {
             pending_lua: Vec::new(),
             determined_lua: Vec::new(),
-            llm_task: None,
         }
     }
 
@@ -66,12 +63,6 @@ impl AgentResources {
         pending.output = Some(output);
         self.determined_lua.push(pending);
         Ok(())
-    }
-
-    pub fn cancel_llm(&mut self) {
-        if let Some(handle) = self.llm_task.take() {
-            handle.abort();
-        }
     }
 }
 
@@ -131,6 +122,8 @@ enum CommandResult {
 }
 
 pub struct Agent<R: lua::LuaRuntime, I> {
+    running: bool,
+
     io: I,
     config: Config,
     resources: Arc<Mutex<AgentResources>>,
@@ -140,6 +133,7 @@ pub struct Agent<R: lua::LuaRuntime, I> {
     lua: R,
 
     input_rx: mpsc::Receiver<Input>,
+    signal_rx: mpsc::Receiver<io::Signal>,
     output_tx: mpsc::Sender<Output>,
 }
 
@@ -157,6 +151,7 @@ where
         io_chan: IOChan,
     ) -> Self {
         Self {
+            running: false,
             resources,
             io,
             config: config.clone(),
@@ -164,6 +159,7 @@ where
             lua: lua,
             output_tx: io_chan.output_tx,
             input_rx: io_chan.input_rx,
+            signal_rx: io_chan.signal_rx,
         }
     }
 
@@ -176,10 +172,14 @@ where
     }
 
     async fn pre_run(&mut self) -> Result<()> {
+        self.running = true;
         Ok(())
     }
 
     async fn post_run(&mut self) -> Result<()> {
+        self.output_tx
+            .send(Output::SystemMsg("Agent stopped.".to_string()))
+            .await?;
         self.io.close()?;
         Ok(())
     }
@@ -217,15 +217,17 @@ where
     }
 
     async fn main_loop(&mut self) -> Result<()> {
-        loop {
+        while self.running {
             tokio::select! {
-                Some(input) = self.input_rx.recv() => {
-                    if self.handle_input(input).await? {
-                        break
+                Some(signal) = self.signal_rx.recv() => {
+                    if signal == io::Signal::Exit {
+                        self.running = false;
+                        break;
                     }
+                    send_output(&self.output_tx, Output::SystemMsg(format!("Received signal: {:?}", signal))).await?;
                 }
-                else => {
-                    break;
+                Some(input) = self.input_rx.recv() => {
+                    self.handle_input(input).await?;
                 }
             }
         }
@@ -272,10 +274,9 @@ where
             let guard = self.resources.lock().await;
             guard.get_lua_targets(target)
         };
-        let mut results = Vec::new();
         for id in targets {
+            let mut guard = self.resources.lock().await;
             let output = {
-                let mut guard = self.resources.lock().await;
                 let (code, timeout_sec) = guard
                     .pending_lua_job(&id)
                     .ok_or_else(|| anyhow!("No pending lua with id {}", id))?;
@@ -286,11 +287,33 @@ where
                 guard.determine_lua(&id, true, result.clone())?;
                 result
             };
-            results.push((id.clone(), output));
+            send_output(
+                &self.output_tx,
+                Output::LuaResult {
+                    id: id.clone(),
+                    output: output.clone(),
+                },
+            )
+            .await?;
         }
-        if !results.is_empty() {
-            let mut llm = self.llm.lock().await;
-            llm.send_lua_results(&results).await?;
+        // Check and send
+        {
+            let guard = self.resources.lock().await;
+            if !guard.has_pending_lua() {
+                let results = guard
+                    .determined_lua
+                    .iter()
+                    .filter_map(|p| {
+                        if p.approved {
+                            Some((p.id.clone(), p.output.clone().unwrap_or_default()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<(String, String)>>();
+                let mut llm = self.llm.lock().await;
+                llm.send_lua_results(&results).await?;
+            }
         }
         Ok(())
     }
@@ -321,8 +344,6 @@ where
                 return Ok(CommandResult::Exit);
             }
             io::Command::Cancel => {
-                let mut guard = self.resources.lock().await;
-                guard.cancel_llm();
                 send_output(
                     &self.output_tx,
                     Output::SystemMsg("Cancelled. One more time to exit.".to_string()),
@@ -407,33 +428,27 @@ where
         Ok(CommandResult::Handled)
     }
 
-    async fn handle_user_input(&self, input: &str) -> Result<()> {
-        // Spawn a task
-        let task = {
-            let llm: Arc<Mutex<BoxedLLMClient>> = self.llm.clone();
-            let input = input.to_string();
-            let output_tx = self.output_tx.clone();
-            tokio::spawn(async move {
-                let send_result = {
-                    let mut llm = llm.lock().await;
-                    llm.send_user_msg(&input).await
-                };
-                match send_result {
-                    Ok(()) => Ok(()),
-                    Err(err) => {
-                        let _ = output_tx
-                            .send(Output::SystemMsg(format!(
-                                "Failed to send message to LLM: {}",
-                                err
-                            )))
-                            .await;
-                        Err(err)
-                    }
-                }
-            })
-        };
-        self.resources.lock().await.llm_task = Some(task);
-        Ok(())
+    async fn handle_user_input(&mut self, input: &str) -> Result<()> {
+        let llm: Arc<Mutex<BoxedLLMClient>> = self.llm.clone();
+        let input = input.to_string();
+        let output_tx = self.output_tx.clone();
+        let mut llm = llm.lock().await;
+
+        tokio::select! {
+            t = self.signal_rx.recv() => {
+                Ok(())
+            }
+            send_result = llm.send_user_msg(&input) => {
+                send_result.map_err(|err| {
+                    let _ = output_tx
+                        .try_send(Output::SystemMsg(format!(
+                            "Failed to send message to LLM: {}",
+                            err
+                        )));
+                    err
+                })
+            }
+        }
     }
 }
 

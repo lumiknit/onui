@@ -1,4 +1,10 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum Signal {
+    Exit,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Exit,
     Cancel,
@@ -71,6 +77,17 @@ impl Input {
         }
 
         Self::Text(original.to_string())
+    }
+
+    pub fn as_signal(&self) -> Option<Signal> {
+        match self {
+            Input::Command { cmd, .. } => match cmd {
+                Command::Exit => Some(Signal::Exit),
+                Command::Cancel => Some(Signal::Cancel),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 }
 

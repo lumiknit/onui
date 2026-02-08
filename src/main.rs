@@ -40,6 +40,5 @@ async fn main() -> anyhow::Result<()> {
     agent.run().await.context("running agent")?;
 
     // Exit, even all tasks are not finished yet.
-    println!("Exiting...");
     exit(0);
 }

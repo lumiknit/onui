@@ -56,11 +56,11 @@ impl OpenAITool {
 #[derive(Serialize, Deserialize, Clone)]
 struct OpenAIMessage {
     role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     content: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     tool_calls: Vec<OpenAIToolCall>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     tool_call_id: Option<String>,
 }
 
@@ -118,15 +118,27 @@ struct OpenAIChatRequest<'a> {
 }
 
 // Chat Response
+#[derive(Deserialize)]
+struct OpenAIUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
 
 #[derive(Deserialize)]
 struct OpenAIChatResponse {
+    #[serde(default)]
+    id: String,
     choices: Vec<OpenAIChoice>,
+    usage: OpenAIUsage,
 }
 
 #[derive(Deserialize)]
 struct OpenAIChoice {
     message: OpenAIMessage,
+
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 pub struct OpenAIClient {

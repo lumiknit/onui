@@ -18,7 +18,7 @@ impl LuaExecution {
     pub fn to_string(&self) -> String {
         let mut result = String::new();
 
-        result.push_str(&"-- Stdin\n");
+        result.push_str(&"-- StdOut\n");
         result.push_str(&self.stdout);
 
         result.push_str(&"-- Returns\n");
