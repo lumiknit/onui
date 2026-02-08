@@ -9,6 +9,16 @@ pub enum Status {
     Generating,
 }
 
+impl Status {
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            Status::Idle => "Idle",
+            Status::WaitForLuaResult => "Waiting for Lua Result",
+            Status::Generating => "Generating",
+        }
+    }
+}
+
 #[async_trait(?Send)]
 pub trait LLMEventHandler {
     /// Called when a new chunk of assistant message is received.
@@ -48,4 +58,4 @@ pub trait LLMClient {
     async fn send_lua_results(&mut self, results: &[(String, String)]) -> Result<()>;
 }
 
-pub type BoxedLLMClient = Box<dyn LLMClient>;
+pub type DynLLMClient = Box<dyn LLMClient>;

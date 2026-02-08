@@ -65,11 +65,6 @@ pub struct LuaVM {
     out_buffer: Rc<RefCell<String>>,
 }
 
-pub trait LuaRuntime {
-    fn execute_script(&self, script: &str, timeout_sec: Option<u64>) -> Result<LuaExecution>;
-    fn reset(&mut self) -> Result<()>;
-}
-
 impl LuaVM {
     /// Initialize a new Lua instance with the built-in functions.
     fn setup_functions(&mut self) -> Result<()> {
@@ -197,14 +192,8 @@ impl LuaVM {
             }),
         }
     }
-}
 
-impl LuaRuntime for LuaVM {
-    fn execute_script(&self, script: &str, timeout_sec: Option<u64>) -> Result<LuaExecution> {
-        LuaVM::execute_script(self, script, timeout_sec)
-    }
-
-    fn reset(&mut self) -> Result<()> {
+    pub fn reset(&mut self) -> Result<()> {
         *self = LuaVM::new()?;
         Ok(())
     }

@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::io::{self, IO, IOChan, Input, Output};
-use crate::llm::{BoxedLLMClient, LLMClient, LLMEventHandler, Status};
-use crate::lua::{self, LuaRuntime};
+use crate::llm::{DynLLMClient, LLMClient, LLMEventHandler};
+use crate::lua::LuaVM;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -30,6 +30,11 @@ impl AgentResources {
             pending_lua: Vec::new(),
             determined_lua: Vec::new(),
         }
+    }
+
+    pub fn clear_lua(&mut self) {
+        self.pending_lua.clear();
+        self.determined_lua.clear();
     }
 
     pub fn has_pending_lua(&self) -> bool {
@@ -120,31 +125,30 @@ enum CommandResult {
     Handled,
 }
 
-pub struct Agent<R: lua::LuaRuntime, I> {
+pub struct Agent<I> {
     running: bool,
 
     io: I,
     config: Config,
     resources: Arc<Mutex<AgentResources>>,
 
-    llm: Arc<Mutex<BoxedLLMClient>>,
+    llm: Arc<Mutex<DynLLMClient>>,
 
-    lua: R,
+    lua: LuaVM,
 
     input_rx: mpsc::Receiver<Input>,
     signal_rx: mpsc::Receiver<io::Signal>,
     output_tx: mpsc::Sender<Output>,
 }
 
-impl<R, I> Agent<R, I>
+impl<I> Agent<I>
 where
-    R: LuaRuntime,
     I: IO,
 {
     pub fn new(
         config: &Config,
         llm: Box<dyn LLMClient>,
-        lua: R,
+        lua: LuaVM,
         resources: Arc<Mutex<AgentResources>>,
         io: I,
         io_chan: IOChan,
@@ -185,26 +189,14 @@ where
     }
 
     async fn show_status(&mut self) -> Result<()> {
-        let llm_status = {
+        let (llm_status, llm_model, token_used, token_limit) = {
             let llm = self.llm.lock().await;
-            llm.get_status()
-        };
-        let llm_status_text = match llm_status {
-            Status::Idle => "idle",
-            Status::WaitForLuaResult => "waiting for lua",
-            Status::Generating => "generating",
+            let (used, limit) = llm.context_size();
+            (llm.get_status(), llm.get_model_name(), used, limit)
         };
         let pending_lua = {
             let guard = self.resources.lock().await;
             guard.pending_lua.len()
-        };
-        let llm_model = {
-            let llm = self.llm.lock().await;
-            llm.get_model_name()
-        };
-        let (token_used, token_limit) = {
-            let llm = self.llm.lock().await;
-            llm.context_size()
         };
         let msg = format!(
             "[onui Status]\n\
@@ -216,7 +208,7 @@ where
             - Pending Lua scripts: {}",
             self.config.default_llm,
             llm_model,
-            llm_status_text,
+            llm_status.to_str(),
             token_used,
             token_limit,
             self.config.workspace_dir().display(),
@@ -306,26 +298,7 @@ where
             )
             .await?;
         }
-        // Check and send
-        {
-            let guard = self.resources.lock().await;
-            if !guard.has_pending_lua() {
-                let results = guard
-                    .determined_lua
-                    .iter()
-                    .filter_map(|p| {
-                        if p.approved {
-                            Some((p.id.clone(), p.output.clone().unwrap_or_default()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<(String, String)>>();
-                let mut llm = self.llm.lock().await;
-                llm.send_lua_results(&results).await?;
-            }
-        }
-        Ok(())
+        self.check_lua().await
     }
 
     async fn reject_lua(&mut self, target: ApprovalTarget) -> Result<()> {
@@ -333,17 +306,28 @@ where
             let guard = self.resources.lock().await;
             guard.get_lua_targets(target)
         };
-        let mut results = Vec::new();
         for id in targets {
             let mut guard = self.resources.lock().await;
             let output = "Reject by user.".to_string();
             guard.determine_lua(&id, false, output.clone())?;
-            results.push((id.clone(), output));
         }
-        if !results.is_empty() {
-            let mut llm = self.llm.lock().await;
-            llm.send_lua_results(&results).await?;
+        self.check_lua().await
+    }
+
+    async fn check_lua(&mut self) -> Result<()> {
+        let mut guard = self.resources.lock().await;
+        if guard.has_pending_lua() {
+            return Ok(());
         }
+        let results = guard
+            .determined_lua
+            .iter()
+            .map(|p| (p.id.clone(), p.output.clone().unwrap_or_default()))
+            .collect::<Vec<(String, String)>>();
+        guard.clear_lua();
+
+        let mut llm = self.llm.lock().await;
+        llm.send_lua_results(&results).await?;
         Ok(())
     }
 
@@ -378,8 +362,7 @@ where
                 {
                     let mut guard = self.resources.lock().await;
                     self.lua.reset()?;
-                    guard.pending_lua.clear();
-                    guard.determined_lua.clear();
+                    guard.clear_lua();
                 }
                 send_output(
                     &self.output_tx,
@@ -439,7 +422,7 @@ where
     }
 
     async fn handle_user_input(&mut self, input: &str) -> Result<()> {
-        let llm: Arc<Mutex<BoxedLLMClient>> = self.llm.clone();
+        let llm: Arc<Mutex<DynLLMClient>> = self.llm.clone();
         let input = input.to_string();
         let output_tx = self.output_tx.clone();
         let mut llm = llm.lock().await;

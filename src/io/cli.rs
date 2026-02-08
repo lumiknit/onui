@@ -10,6 +10,8 @@ use crate::io::{Input, Signal};
 
 use super::{IOChan, Output};
 
+const CHANNEL_BUFFER_SIZE: usize = 32;
+
 /// CliIO is an implementation of IO, which is for command line interface.
 pub struct CliIO {
     async_tasks: Vec<JoinHandle<()>>,
@@ -42,9 +44,9 @@ impl super::IO for CliIO {
             return Err(anyhow!("CliIO is already open"));
         }
 
-        let (input_tx, input_rx) = mpsc::channel(32);
-        let (signal_tx, signal_rx) = mpsc::channel(32);
-        let (output_tx, output_rx) = mpsc::channel(32);
+        let (input_tx, input_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+        let (signal_tx, signal_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+        let (output_tx, output_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
         {
             let input_tx = input_tx.clone();
